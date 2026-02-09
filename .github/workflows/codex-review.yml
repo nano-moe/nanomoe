@@ -187,7 +187,7 @@ jobs:
           prompt-file: codex-prompt.md
           output-schema-file: codex-output-schema.json
           output-file: codex-output.json
-          sandbox: workspace-write
+          sandbox: read-only
           model: ${{ env.CODEX_MODEL }}
           effort: xhigh
       - name: Inspect structured Codex output
