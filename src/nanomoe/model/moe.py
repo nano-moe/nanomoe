@@ -6,13 +6,13 @@ Features:
 - Optional shared expert
 - Efficient batched expert computation
 """
-from packaging.version import parse as V
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
 from nanomoe.model.config import MoEConfig
+from nanomoe.model.moe_router import NaiveTopKRouter
 
 
 class SwiGLU(nn.Module):
@@ -39,76 +39,8 @@ class Expert(nn.Module):
         return self.ffn(x)
 
 
-class TopKRouter(nn.Module):
-    """Top-k expert router with auxiliary load balancing loss."""
-
-    def __init__(self, config: MoEConfig):
-        super().__init__()
-        self.num_experts = config.num_experts
-        self.num_experts_per_tok = config.num_experts_per_tok
-        self.aux_loss_coef = config.router_aux_loss_coef
-        self.jitter_noise = config.router_jitter_noise
-
-        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
-
-    def forward(self, hidden_states: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        """Route tokens to experts.
-
-        Args:
-            hidden_states: [batch_size, seq_len, hidden_size] or [num_tokens, hidden_size]
-
-        Returns:
-            router_logits: [num_tokens, num_experts]
-            expert_indices: [num_tokens, num_experts_per_tok]
-            expert_weights: [num_tokens, num_experts_per_tok]
-        """
-        orig_shape = hidden_states.shape
-        if hidden_states.dim() == 3:
-            hidden_states = hidden_states.view(-1, orig_shape[-1])
-
-        # Add jitter noise during training
-        if self.training and self.jitter_noise > 0:
-            hidden_states = hidden_states * (1.0 + torch.randn_like(hidden_states) * self.jitter_noise)
-
-        # Compute router logits
-        router_logits = self.gate(hidden_states)  # [num_tokens, num_experts]
-
-        # Top-k selection
-        router_weights = F.softmax(router_logits, dim=-1)
-        expert_weights, expert_indices = torch.topk(router_weights, self.num_experts_per_tok, dim=-1)
-
-        # Renormalize weights
-        expert_weights = expert_weights / expert_weights.sum(dim=-1, keepdim=True)
-
-        return router_logits, expert_indices, expert_weights
-
-    def compute_aux_loss(self, router_logits: Tensor) -> Tensor:
-        """Compute auxiliary load balancing loss.
-
-        Encourages uniform expert utilization.
-        """
-        if self.aux_loss_coef == 0:
-            return torch.tensor(0.0, device=router_logits.device)
-
-        num_tokens = router_logits.shape[0]
-
-        # Fraction of tokens routed to each expert
-        router_probs = F.softmax(router_logits, dim=-1)
-        expert_mask = torch.zeros_like(router_probs)
-        _, indices = torch.topk(router_probs, self.num_experts_per_tok, dim=-1)
-        expert_mask.scatter_(-1, indices, 1.0)
-
-        # f_i: fraction of tokens assigned to expert i
-        tokens_per_expert = expert_mask.sum(dim=0)
-        f = tokens_per_expert / num_tokens
-
-        # P_i: average router probability for expert i
-        P = router_probs.mean(dim=0)
-
-        # Auxiliary loss: sum_i(f_i * P_i) * num_experts
-        aux_loss = (f * P).sum() * self.num_experts
-
-        return aux_loss * self.aux_loss_coef
+class TopKRouter(NaiveTopKRouter):
+    """Backwards-compatible alias for the default naive top-k router."""
 
 
 class MoELayer(nn.Module):
