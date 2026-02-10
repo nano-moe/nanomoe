@@ -4,7 +4,7 @@ Features:
 - Rotary Position Embeddings (RoPE)
 - Grouped Query Attention (GQA)
 - Flash Attention 2 support via F.scaled_dot_product_attention
-- Document masking via cu_seqlens
+- Document masking via cu_seqlens (TODO: This is not implemented yet)
 """
 
 import torch
