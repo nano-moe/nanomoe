@@ -110,17 +110,24 @@ def _attention_with_flex(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_s
         return flex_attention(q, k, v, block_mask=block_mask)
 
 
-def _benchmark_cuda_ms(fn: Callable[[], torch.Tensor], warmup: int, iters: int) -> float:
+def _benchmark_cuda_ms_and_peak_bytes(
+    fn: Callable[[], torch.Tensor], warmup: int, iters: int
+) -> tuple[float, int]:
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
 
-    start = time.perf_counter()
+    total_s = 0.0
+    peak_bytes = 0
     for _ in range(iters):
+        torch.cuda.reset_peak_memory_stats()
+        start = time.perf_counter()
         fn()
-    torch.cuda.synchronize()
-    elapsed_ms = (time.perf_counter() - start) * 1000.0 / iters
-    return elapsed_ms
+        torch.cuda.synchronize()
+        total_s += time.perf_counter() - start
+        peak_bytes = max(peak_bytes, int(torch.cuda.max_memory_allocated()))
+    elapsed_ms = total_s * 1000.0 / iters
+    return elapsed_ms, peak_bytes
 
 
 def _make_qkv(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -182,7 +189,7 @@ def test_packed_attention_runtime_benchmark_cuda() -> None:
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
     # 8 documents packed into one 2K-token sequence.
-    lengths = [256, 224, 320, 192, 384, 160, 256, 256]
+    lengths = [256, 224, 320, 192, 384, 160, 256, 256, 1024, 4096]
     cu_seqlens = torch.tensor(
         [0, *torch.cumsum(torch.tensor(lengths), dim=0).tolist()],
         dtype=torch.int32,
@@ -190,9 +197,9 @@ def test_packed_attention_runtime_benchmark_cuda() -> None:
     )
     total_tokens = int(cu_seqlens[-1].item())
 
-    q = torch.randn(1, 16, total_tokens, 64, device=device, dtype=dtype)
-    k = torch.randn(1, 16, total_tokens, 64, device=device, dtype=dtype)
-    v = torch.randn(1, 16, total_tokens, 64, device=device, dtype=dtype)
+    q = torch.randn(4, 16, total_tokens, 64, device=device, dtype=dtype)
+    k = torch.randn(4, 16, total_tokens, 64, device=device, dtype=dtype)
+    v = torch.randn(4, 16, total_tokens, 64, device=device, dtype=dtype)
 
     mask_4d = _packed_4d_mask_from_cu_seqlens(cu_seqlens, dtype=q.dtype)
     doc_ids = _doc_ids_from_cu_seqlens(cu_seqlens)
@@ -233,6 +240,8 @@ def test_packed_attention_runtime_benchmark_cuda() -> None:
 
     run_flex_compiled = None
     flex_compile_error = None
+    run_4d_compiled = None
+    mask4d_compile_error = None
     if hasattr(torch, "compile"):
         try:
             compiled_flex_attention = torch.compile(flex_attention)
@@ -241,6 +250,29 @@ def test_packed_attention_runtime_benchmark_cuda() -> None:
                 return compiled_flex_attention(q, k, v, block_mask=block_mask)
         except Exception as exc:  # pragma: no cover - env/backend dependent
             flex_compile_error = exc
+        try:
+
+            def _attention_with_4d_mask_compiled(
+                q_in: torch.Tensor,
+                k_in: torch.Tensor,
+                v_in: torch.Tensor,
+                mask_in: torch.Tensor,
+            ) -> torch.Tensor:
+                return F.scaled_dot_product_attention(
+                    q_in,
+                    k_in,
+                    v_in,
+                    attn_mask=mask_in,
+                    dropout_p=0.0,
+                    is_causal=False,
+                )
+
+            compiled_4d_attention = torch.compile(_attention_with_4d_mask_compiled)
+
+            def run_4d_compiled() -> torch.Tensor:
+                return compiled_4d_attention(q, k, v, mask_4d)
+        except Exception as exc:  # pragma: no cover - env/backend dependent
+            mask4d_compile_error = exc
 
     # Sanity check correctness at benchmark shape.
     out_cu = run_cu()
@@ -251,28 +283,61 @@ def test_packed_attention_runtime_benchmark_cuda() -> None:
     if run_flex_compiled is not None:
         out_flex_compiled = run_flex_compiled()
         torch.testing.assert_close(out_cu, out_flex_compiled, atol=5e-2, rtol=5e-2)
+    if run_4d_compiled is not None:
+        out_4d_compiled = run_4d_compiled()
+        torch.testing.assert_close(out_cu, out_4d_compiled, atol=5e-2, rtol=5e-2)
 
     warmup, iters = 5, 30
-    cu_ms = _benchmark_cuda_ms(run_cu, warmup=warmup, iters=iters)
-    flex_ms = _benchmark_cuda_ms(run_flex, warmup=warmup, iters=iters)
-    mask4d_ms = _benchmark_cuda_ms(run_4d, warmup=warmup, iters=iters)
+    cu_ms, cu_peak = _benchmark_cuda_ms_and_peak_bytes(run_cu, warmup=warmup, iters=iters)
+    flex_ms, flex_peak = _benchmark_cuda_ms_and_peak_bytes(run_flex, warmup=warmup, iters=iters)
+    mask4d_ms, mask4d_peak = _benchmark_cuda_ms_and_peak_bytes(run_4d, warmup=warmup, iters=iters)
     flex_compiled_ms = None
+    flex_compiled_peak = None
+    mask4d_compiled_ms = None
+    mask4d_compiled_peak = None
     if run_flex_compiled is not None:
-        flex_compiled_ms = _benchmark_cuda_ms(run_flex_compiled, warmup=warmup, iters=iters)
+        flex_compiled_ms, flex_compiled_peak = _benchmark_cuda_ms_and_peak_bytes(
+            run_flex_compiled, warmup=warmup, iters=iters
+        )
+    if run_4d_compiled is not None:
+        mask4d_compiled_ms, mask4d_compiled_peak = _benchmark_cuda_ms_and_peak_bytes(
+            run_4d_compiled, warmup=warmup, iters=iters
+        )
 
     print(f"packed-attn benchmark ({dtype}, tokens={total_tokens}, heads=16, head_dim=64)")
-    print(f"cu_seqlens varlen SDPA: {cu_ms:.3f} ms/iter")
-    print(f"flex attention       : {flex_ms:.3f} ms/iter")
+    print(f"cu_seqlens varlen SDPA: {cu_ms:.3f} ms/iter, peak={cu_peak / (1024 * 1024):.1f} MB")
+    print(f"flex attention       : {flex_ms:.3f} ms/iter, peak={flex_peak / (1024 * 1024):.1f} MB")
     if flex_compiled_ms is not None:
-        print(f"flex attention+compile: {flex_compiled_ms:.3f} ms/iter")
+        print(
+            "flex attention+compile:"
+            f" {flex_compiled_ms:.3f} ms/iter, peak={flex_compiled_peak / (1024 * 1024):.1f} MB"
+        )
     elif flex_compile_error is not None:
         print(f"flex attention+compile: unavailable ({type(flex_compile_error).__name__}: {flex_compile_error})")
     else:
         print("flex attention+compile: unavailable (torch.compile not present)")
-    print(f"4d attention mask    : {mask4d_ms:.3f} ms/iter")
+    print(f"4d attention mask    : {mask4d_ms:.3f} ms/iter, peak={mask4d_peak / (1024 * 1024):.1f} MB")
+    if mask4d_compiled_ms is not None:
+        print(
+            "4d mask+compile      :"
+            f" {mask4d_compiled_ms:.3f} ms/iter, peak={mask4d_compiled_peak / (1024 * 1024):.1f} MB"
+        )
+    elif mask4d_compile_error is not None:
+        print(f"4d mask+compile      : unavailable ({type(mask4d_compile_error).__name__}: {mask4d_compile_error})")
+    else:
+        print("4d mask+compile      : unavailable (torch.compile not present)")
 
     assert cu_ms > 0.0
     assert flex_ms > 0.0
     assert mask4d_ms > 0.0
+    assert cu_peak > 0
+    assert flex_peak > 0
+    assert mask4d_peak > 0
     if flex_compiled_ms is not None:
         assert flex_compiled_ms > 0.0
+        assert flex_compiled_peak is not None
+        assert flex_compiled_peak > 0
+    if mask4d_compiled_ms is not None:
+        assert mask4d_compiled_ms > 0.0
+        assert mask4d_compiled_peak is not None
+        assert mask4d_compiled_peak > 0

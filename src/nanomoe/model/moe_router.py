@@ -53,39 +53,9 @@ class BaseRouter(nn.Module, ABC):
 
     def normalize_router_logits(self, router_logits: Tensor) -> Tensor:
         """Normalize logits into routing probabilities."""
-        if self.prob_normalization == "softmax":
-            return softmax_normalize(router_logits)
-        if self.prob_normalization == "sigmoid":
-            return sigmoid_normalize(router_logits)
-        raise ValueError(f"Unsupported prob_normalization: {self.prob_normalization}")
-
-    def _prepare_hidden_states(self, hidden_states: Tensor) -> Tensor:
-        """Flatten hidden states and apply optional jitter noise."""
-        if hidden_states.dim() not in (2, 3):
-            raise ValueError(f"hidden_states must be rank-2 or rank-3, got rank {hidden_states.dim()}")
-
-        if hidden_states.dim() == 3:
-            hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
-
-        if self.training and self.jitter_noise > 0:
-            hidden_states = hidden_states * (1.0 + torch.randn_like(hidden_states) * self.jitter_noise)
-
-        return hidden_states
-
-    def _validate_router_logits(self, router_logits: Tensor) -> None:
-        if router_logits.dim() != 2 or router_logits.shape[-1] != self.num_experts:
-            msg = (
-                "compute_router_logits must return [num_tokens, num_experts], "
-                f"got shape {tuple(router_logits.shape)}"
-            )
-            raise ValueError(msg)
 
     def _select_topk(self, router_probs: Tensor) -> tuple[Tensor, Tensor]:
         """Select top-k experts per token and re-normalize top-k weights."""
-        expert_weights, expert_indices = torch.topk(router_probs, self.num_experts_per_tok, dim=-1)
-        denom = expert_weights.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(expert_weights.dtype).eps)
-        expert_weights = expert_weights / denom
-        return expert_indices, expert_weights
 
     def forward(self, hidden_states: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         """Route tokens to experts.
@@ -98,33 +68,9 @@ class BaseRouter(nn.Module, ABC):
             expert_indices: [num_tokens, num_experts_per_tok]
             expert_weights: [num_tokens, num_experts_per_tok]
         """
-        hidden_states = self._prepare_hidden_states(hidden_states)
-        router_logits = self.compute_router_logits(hidden_states)
-        self._validate_router_logits(router_logits)
-
-        router_probs = self.normalize_router_logits(router_logits)
-        expert_indices, expert_weights = self._select_topk(router_probs)
-        return router_logits, expert_indices, expert_weights
 
     def compute_aux_loss(self, router_logits: Tensor) -> Tensor:
         """Compute standard load balancing auxiliary loss."""
-        if self.aux_loss_coef == 0 or router_logits.numel() == 0:
-            return router_logits.new_zeros(())
-
-        num_tokens = router_logits.shape[0]
-        if num_tokens == 0:
-            return router_logits.new_zeros(())
-
-        router_probs = self.normalize_router_logits(router_logits)
-        expert_mask = torch.zeros_like(router_probs)
-        _, topk_indices = torch.topk(router_probs, self.num_experts_per_tok, dim=-1)
-        expert_mask.scatter_(-1, topk_indices, 1.0)
-
-        tokens_per_expert = expert_mask.sum(dim=0)
-        f = tokens_per_expert / num_tokens
-        p = router_probs.mean(dim=0)
-        aux_loss = (f * p).sum() * self.num_experts
-        return aux_loss * self.aux_loss_coef
 
 
 class LinearRouter(BaseRouter):
@@ -142,25 +88,12 @@ class NaiveTopKRouter(LinearRouter):
     """Naive top-k router (standard softmax + top-k selection)."""
 
 
-class SwitchTop1Router(NaiveTopKRouter):
-    """Switch-style router that always dispatches each token to one expert."""
-
-    def __init__(self, config: MoEConfig):
-        super().__init__(config)
-        self.num_experts_per_tok = 1
-
-    def _select_topk(self, router_probs: Tensor) -> tuple[Tensor, Tensor]:
-        expert_weights, expert_indices = torch.topk(router_probs, 1, dim=-1)
-        return expert_indices, torch.ones_like(expert_weights)
-
-
 class StraightThroughTopKRouter(LinearRouter):
     """Top-k hard routing with a straight-through estimator on selected experts."""
 
     def forward(self, hidden_states: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         hidden_states = self._prepare_hidden_states(hidden_states)
         router_logits = self.compute_router_logits(hidden_states)
-        self._validate_router_logits(router_logits)
         router_probs = self.normalize_router_logits(router_logits)
 
         topk_indices = torch.topk(router_probs, self.num_experts_per_tok, dim=-1).indices
@@ -214,7 +147,7 @@ class GumbelStraightThroughTopKRouter(LinearRouter):
         expert_weights = torch.gather(ste_probs, -1, topk_indices)
         denom = expert_weights.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(expert_weights.dtype).eps)
         expert_weights = expert_weights / denom
-        return router_logits, topk_indices, expert_weights
+        return router_logits, topk_indices, torch.ones_like(expert_weights) # No need for weighting as we are doing sampling
 
 
 class PolicyGradientRouter(LinearRouter):
@@ -223,6 +156,8 @@ class PolicyGradientRouter(LinearRouter):
     During training, experts are sampled without replacement from the router
     distribution. Call `compute_policy_loss` with token-level rewards to obtain
     a policy gradient loss term for the most recent forward pass.
+
+    WARNING: Not ready for usage
     """
 
     def __init__(
@@ -233,6 +168,8 @@ class PolicyGradientRouter(LinearRouter):
         entropy_coef: float = 0.0,
         baseline_momentum: float = 0.9,
     ):
+        import warnings
+        warnings.warn("NOT READY FOR USE")
         super().__init__(config, prob_normalization=prob_normalization)
         if entropy_coef < 0:
             raise ValueError(f"entropy_coef must be >= 0, got {entropy_coef}")
