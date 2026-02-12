@@ -4,7 +4,7 @@ Features:
 - Rotary Position Embeddings (RoPE)
 - Grouped Query Attention (GQA)
 - Flash Attention 2 support via F.scaled_dot_product_attention
-- Document masking via cu_seqlens (TODO: This is not implemented yet)
+- Document masking via cu_seqlens
 """
 
 from __future__ import annotations
@@ -174,7 +174,6 @@ def _flex_attention(
     packing_seq_lens: Tensor | None,
 ) -> Tensor:
     """Wrapper for flex_attention to handle mask format and causal logic."""
-    del attn_mask, dropout_p, is_causal, position_ids
     if create_block_mask is None or flex_attention is None:
         raise RuntimeError("torch.nn.attention.flex_attention is not available")
     if packing_doc_ids is None or packing_seq_lens is None:
