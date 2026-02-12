@@ -4,15 +4,48 @@ Features:
 - Rotary Position Embeddings (RoPE)
 - Grouped Query Attention (GQA)
 - Flash Attention 2 support via F.scaled_dot_product_attention
-- Document masking via cu_seqlens (TODO: This is not implemented yet)
+- Document masking via cu_seqlens
 """
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from nanomoe.model.config import MoEConfig
+try:
+    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+except Exception:  # pragma: no cover - optional runtime support
+    create_block_mask = None
+    flex_attention = None
+
+if TYPE_CHECKING:
+    from nanomoe.model.config import MoEConfig
+
+# Adopted from https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/masks/document_mask.py
+
+def get_causal_doc_mask(doc_id: Tensor, lengths: Tensor):
+    """
+    doc_id: [batch, seq_len] document ID for each token
+    lengths: [batch] actual sequence length for each batch item (for padding)
+    """
+
+    def _doc_causal_mask(b, h, q_idx, kv_idx):
+        del h
+        q_ok = q_idx < lengths[b]
+        kv_ok = kv_idx < lengths[b]
+        same_doc = doc_id[b, q_idx] == doc_id[b, kv_idx]
+        causal = q_idx >= kv_idx
+        return q_ok & kv_ok & same_doc & causal
+
+    return _doc_causal_mask
+
+
+# Backward-compatible alias for previous typo.
+get_casual_doc_mask = get_causal_doc_mask
 
 
 class RoPE(nn.Module):
@@ -99,6 +132,69 @@ def apply_rope(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor) -> tuple[Tensor, 
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
+def _fsdp_attention(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    attn_mask: Tensor | None,
+    dropout_p: float,
+    is_causal: bool,
+    position_ids: Tensor | None,
+    packing_doc_ids: Tensor | None,
+    packing_seq_lens: Tensor | None,
+) -> Tensor:
+    """Wrapper for F.scaled_dot_product_attention to handle mask format and causal logic."""
+    del position_ids, packing_doc_ids, packing_seq_lens
+    # Convert additive 4D masks into the boolean mask format expected by SDPA.
+    if attn_mask is not None:
+        # Packed 4D mask uses additive values: 0 for attend and -inf for masked.
+        # For boolean SDPA masks, True means attend and False means masked.
+        if attn_mask.dtype != torch.bool:
+            attn_mask = attn_mask == 0
+
+    return F.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        is_causal=is_causal,
+    )
+
+
+def _flex_attention(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    attn_mask: Tensor | None,
+    dropout_p: float,
+    is_causal: bool,
+    position_ids: Tensor | None,
+    packing_doc_ids: Tensor | None,
+    packing_seq_lens: Tensor | None,
+) -> Tensor:
+    """Wrapper for flex_attention to handle mask format and causal logic."""
+    if create_block_mask is None or flex_attention is None:
+        raise RuntimeError("torch.nn.attention.flex_attention is not available")
+    if packing_doc_ids is None or packing_seq_lens is None:
+        raise ValueError("flex_attention requires packing_doc_ids and packing_seq_lens")
+
+    mask_mod = get_causal_doc_mask(packing_doc_ids, packing_seq_lens)
+    block_mask = create_block_mask(
+        mask_mod,
+        B=int(q.shape[0]),
+        H=None,
+        Q_LEN=int(q.shape[2]),
+        KV_LEN=int(k.shape[2]),
+        device=q.device,
+    )
+    return flex_attention(
+        q,
+        k,
+        v,
+        block_mask=block_mask,
+    )
+
 
 class Attention(nn.Module):
     """Multi-head attention with GQA and RoPE support."""
@@ -127,11 +223,23 @@ class Attention(nn.Module):
         # Dropout
         self.attention_dropout = config.attention_dropout
 
+        # Attention function
+        attn_type = getattr(config, "attention_type", "fsdp_attention")
+        if attn_type == "fsdp_attention":
+            self.attention_fn = _fsdp_attention
+        elif attn_type == "flex_attention":
+            self.attention_fn = _flex_attention
+        else:
+            raise ValueError(f"Unsupported attention_type: {attn_type}")
+
+    @torch.compile
     def forward(
         self,
         hidden_states: Tensor,
         attention_mask: Tensor | None = None,
         position_ids: Tensor | None = None,
+        packing_doc_ids: Tensor | None = None, # For packed attention, shape [batch, seq_len]
+        packing_seq_lens: Tensor | None = None, # For packed attention, shape [batch]
         past_key_value: tuple[Tensor, Tensor] | None = None,
         use_cache: bool = False,
     ) -> tuple[Tensor, tuple[Tensor, Tensor] | None]:
@@ -180,23 +288,16 @@ class Attention(nn.Module):
         # Use F.scaled_dot_product_attention for efficiency (Flash Attention when available)
         dropout_p = self.attention_dropout if self.training else 0.0
 
-        # Convert mask format if needed
-        # F.scaled_dot_product_attention expects mask where True = masked (opposite of typical)
-        if attention_mask is not None:
-            # Our mask: 0 = attend, -inf = masked
-            # SDPA mask: True = masked, False = attend
-            attn_mask = attention_mask < -1000  # Convert -inf to True
-        else:
-            # Create causal mask
-            attn_mask = None  # SDPA handles causal automatically with is_causal=True
-
-        output = F.scaled_dot_product_attention(
+        output = self.attention_fn(
             q,
             k,
             v,
-            attn_mask=attn_mask,
+            attn_mask=attention_mask,
             dropout_p=dropout_p,
             is_causal=attention_mask is None,  # Use built-in causal if no custom mask
+            position_ids=position_ids,
+            packing_doc_ids=packing_doc_ids,
+            packing_seq_lens=packing_seq_lens,
         )
 
         # Reshape and project output
