@@ -38,6 +38,7 @@ class MoEConfig:
     num_attention_heads: int = 12
     num_key_value_heads: int = 4  # For GQA (set = num_attention_heads for MHA)
     head_dim: int | None = None  # If None, computed as hidden_size // num_attention_heads
+    attention_type: str = "fsdp_attention"  # "fsdp_attention" or "flex_attention"
     max_position_embeddings: int = 8192
     rope_theta: float = 1000000.0  # RoPE base frequency
 
@@ -47,10 +48,13 @@ class MoEConfig:
     num_experts_per_tok: int = 2  # Active experts per token (top-k)
     shared_expert: bool = False  # Whether to have a shared expert (always active)
     shared_expert_intermediate_size: int | None = None  # If None, uses intermediate_size
+    shared_expert_scale: float = 1.0  # Scale factor for shared expert output (if used)
 
     # Expert routing
+    router_type: str = "topk"  # Router type key from ROUTER_REGISTRY
     router_aux_loss_coef: float = 0.01  # Auxiliary load balancing loss coefficient
     router_jitter_noise: float = 0.0  # Jitter noise for router (training only)
+    moe_kernel: str = "auto"  # "auto", "eager_mm", "grouped_mm", or "grouped_mm_fast"
 
     # Normalization & activation
     rms_norm_eps: float = 1e-6
@@ -62,11 +66,26 @@ class MoEConfig:
 
     # Initialization
     initializer_range: float = 0.02
+    depth_alpha: float = 0.0
 
     # Tie embeddings
-    tie_word_embeddings: bool = True
+    tie_word_embeddings: bool = False
 
     def __post_init__(self):
+        valid_attention_types = {"fsdp_attention", "flex_attention"}
+        if self.attention_type not in valid_attention_types:
+            raise ValueError(
+                f"Unsupported attention_type: {self.attention_type}. "
+                f"Available: {sorted(valid_attention_types)}"
+            )
+
+        valid_moe_kernels = {"auto", "eager_mm", "grouped_mm", "grouped_mm_fast"}
+        if self.moe_kernel not in valid_moe_kernels:
+            raise ValueError(
+                f"Unsupported moe_kernel: {self.moe_kernel}. "
+                f"Available: {sorted(valid_moe_kernels)}"
+            )
+
         if self.head_dim is None:
             object.__setattr__(self, "head_dim", self.hidden_size // self.num_attention_heads)
 
@@ -218,6 +237,7 @@ class MoEConfig:
             "num_attention_heads": self.num_attention_heads,
             "num_key_value_heads": self.num_key_value_heads,
             "head_dim": self.head_dim,
+            "attention_type": self.attention_type,
             "max_position_embeddings": self.max_position_embeddings,
             "rope_theta": self.rope_theta,
             "intermediate_size": self.intermediate_size,
@@ -225,13 +245,16 @@ class MoEConfig:
             "num_experts_per_tok": self.num_experts_per_tok,
             "shared_expert": self.shared_expert,
             "shared_expert_intermediate_size": self.shared_expert_intermediate_size,
+            "router_type": self.router_type,
             "router_aux_loss_coef": self.router_aux_loss_coef,
             "router_jitter_noise": self.router_jitter_noise,
+            "moe_kernel": self.moe_kernel,
             "rms_norm_eps": self.rms_norm_eps,
             "hidden_act": self.hidden_act,
             "attention_dropout": self.attention_dropout,
             "hidden_dropout": self.hidden_dropout,
             "initializer_range": self.initializer_range,
+            "depth_alpha": self.depth_alpha,
             "tie_word_embeddings": self.tie_word_embeddings,
         }
 

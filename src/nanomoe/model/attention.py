@@ -77,7 +77,13 @@ class RoPE(nn.Module):
             self._cos_cached = emb.cos().to(dtype)
             self._sin_cached = emb.sin().to(dtype)
 
-    def forward(self, x: Tensor, position_ids: Tensor | None = None) -> tuple[Tensor, Tensor]:
+    def forward(
+        self,
+        x: Tensor,
+        position_ids: Tensor | None = None,
+        packing_doc_ids: Tensor | None = None,
+        packing_seq_lens: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
         """Get cos and sin for RoPE.
 
         Args:
@@ -87,7 +93,11 @@ class RoPE(nn.Module):
         Returns:
             cos, sin: [seq_len, dim] or [batch, seq_len, dim] if position_ids provided
         """
-        seq_len = int(x.shape[1]) if x.dim() > 2 else int(x.shape[0])
+        del packing_doc_ids, packing_seq_lens
+        if position_ids is not None:
+            seq_len = int(position_ids.max().item()) + 1
+        else:
+            seq_len = int(x.shape[1]) if x.dim() > 2 else int(x.shape[0])
         self._update_cache(seq_len, x.device, x.dtype)
 
         # After _update_cache, these are guaranteed to be set
@@ -269,7 +279,12 @@ class Attention(nn.Module):
         v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         # Apply RoPE
-        cos, sin = self.rope(hidden_states, position_ids)
+        cos, sin = self.rope(
+            hidden_states,
+            position_ids,
+            packing_doc_ids=packing_doc_ids,
+            packing_seq_lens=packing_seq_lens,
+        )
         q, k = apply_rope(q, k, cos, sin)
 
         # Handle KV cache
@@ -294,7 +309,7 @@ class Attention(nn.Module):
             v,
             attn_mask=attention_mask,
             dropout_p=dropout_p,
-            is_causal=attention_mask is None,  # Use built-in causal if no custom mask
+            is_causal=attention_mask is None and not (past_key_value is not None and seq_len == 1),
             position_ids=position_ids,
             packing_doc_ids=packing_doc_ids,
             packing_seq_lens=packing_seq_lens,

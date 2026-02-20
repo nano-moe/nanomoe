@@ -262,3 +262,10 @@ def grouped_mm_experts_forward(
     final_hidden_states = out_per_sample.view(num_tokens, num_top_k, hidden_dim).sum(dim=1)
 
     return final_hidden_states.to(hidden_states.dtype)
+
+
+MOE_KERNEL_REGISTRY = {
+    "eager_mm": eager_mm_experts_forward,
+    "grouped_mm_fast": grouped_mm_experts_forward_fast,
+    "grouped_mm": grouped_mm_experts_forward,
+}

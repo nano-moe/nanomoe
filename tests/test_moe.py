@@ -99,8 +99,8 @@ def _call_eager_or_skip(
 @pytest.mark.parametrize("is_transposed", [False, True])
 @pytest.mark.parametrize("has_bias", [False, True])
 def test_grouped_mm_matches_eager_forward_backward(is_transposed: bool, has_bias: bool) -> None:
-    if not hasattr(torch, "_grouped_mm"):
-        pytest.skip("torch._grouped_mm is not available")
+    if not hasattr(F, "grouped_mm"):
+        pytest.skip("F.grouped_mm is not available")
 
     torch.manual_seed(0)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

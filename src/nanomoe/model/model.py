@@ -25,7 +25,13 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.eps = eps
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        packing_doc_ids: Tensor | None = None,
+        packing_seq_lens: Tensor | None = None,
+    ) -> Tensor:
+        del packing_doc_ids, packing_seq_lens
         variance = x.pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.eps)
         return self.weight * x
@@ -38,6 +44,7 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
+        self.residual_scale = config.num_layers ** (-config.depth_alpha)
 
         # Attention
         self.self_attn = Attention(config, layer_idx)
@@ -50,14 +57,13 @@ class TransformerBlock(nn.Module):
             self.mlp = DenseFFN(config)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
-        # Dropout
-        self.hidden_dropout = nn.Dropout(config.hidden_dropout) if config.hidden_dropout > 0 else nn.Identity()
-
     def forward(
         self,
         hidden_states: Tensor,
         attention_mask: Tensor | None = None,
         position_ids: Tensor | None = None,
+        packing_doc_ids: Tensor | None = None,
+        packing_seq_lens: Tensor | None = None,
         past_key_value: tuple[Tensor, Tensor] | None = None,
         use_cache: bool = False,
     ) -> tuple[Tensor, Tensor, tuple[Tensor, Tensor] | None]:
@@ -75,18 +81,22 @@ class TransformerBlock(nn.Module):
             hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            packing_doc_ids=packing_doc_ids,
+            packing_seq_lens=packing_seq_lens,
             past_key_value=past_key_value,
             use_cache=use_cache,
         )
-        hidden_states = self.hidden_dropout(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = residual + self.residual_scale * hidden_states
 
         # MoE FFN
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states, aux_loss = self.mlp(hidden_states)
-        hidden_states = self.hidden_dropout(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states, aux_loss = self.mlp(
+            hidden_states,
+            packing_doc_ids=packing_doc_ids,
+            packing_seq_lens=packing_seq_lens,
+        )
+        hidden_states = residual + self.residual_scale * hidden_states
 
         return hidden_states, aux_loss, past_key_value
 
@@ -139,6 +149,8 @@ class MoETransformer(nn.Module):
         input_ids: Tensor,
         attention_mask: Tensor | None = None,
         position_ids: Tensor | None = None,
+        packing_doc_ids: Tensor | None = None,
+        packing_seq_lens: Tensor | None = None,
         past_key_values: list[tuple[Tensor, Tensor]] | None = None,
         use_cache: bool = False,
         return_dict: bool = True,
@@ -149,6 +161,8 @@ class MoETransformer(nn.Module):
             input_ids: [batch, seq_len] token IDs
             attention_mask: [batch, 1, seq_len, kv_seq_len] attention mask
             position_ids: [batch, seq_len] position IDs (for packed sequences)
+            packing_doc_ids: [batch, seq_len] document IDs for packed sequences
+            packing_seq_lens: [batch] packed sequence lengths
             past_key_values: KV cache for incremental decoding
             use_cache: Whether to return KV cache
             return_dict: Always True (for compatibility)
@@ -163,12 +177,35 @@ class MoETransformer(nn.Module):
 
         # Default position IDs
         if position_ids is None:
-            position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
+            past_len = 0
+            if past_key_values:
+                first_kv = next((kv for kv in past_key_values if kv is not None), None)
+                if first_kv is not None:
+                    past_len = int(first_kv[0].shape[2])
+            position_ids = (
+                torch.arange(past_len, past_len + seq_len, device=input_ids.device)
+                .unsqueeze(0)
+                .expand(batch_size, -1)
+            )
+
+        # For flex attention, default to one document per batch element if packing metadata
+        # is not provided by the caller.
+        if (
+            self.config.attention_type == "flex_attention"
+            and packing_doc_ids is None
+            and packing_seq_lens is None
+        ):
+            packing_doc_ids = torch.zeros((batch_size, seq_len), device=input_ids.device, dtype=torch.long)
+            packing_seq_lens = torch.full((batch_size,), seq_len, device=input_ids.device, dtype=torch.long)
 
         # Initialize KV cache list
         kv_cache: list[tuple[Tensor, Tensor] | None] = (
             list(past_key_values) if past_key_values else [None] * len(self.layers)
         )
+        if len(kv_cache) != len(self.layers):
+            raise ValueError(
+                f"past_key_values must have one entry per layer, got {len(kv_cache)} for {len(self.layers)} layers"
+            )
         new_key_values: list[tuple[Tensor, Tensor] | None] = []
 
         # Transformer blocks
@@ -178,6 +215,8 @@ class MoETransformer(nn.Module):
                 hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
+                packing_doc_ids=packing_doc_ids,
+                packing_seq_lens=packing_seq_lens,
                 past_key_value=kv_cache[i],
                 use_cache=use_cache,
             )
@@ -191,7 +230,7 @@ class MoETransformer(nn.Module):
         if self.lm_head is not None:
             logits = self.lm_head(hidden_states)
         else:
-            logits = hidden_states @ self.embed_tokens.weight.T
+            logits = hidden_states @ self.embed_tokens.weight.T # tie word embeddings
 
         return ModelOutput(
             logits=logits,

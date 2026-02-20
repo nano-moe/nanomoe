@@ -43,6 +43,8 @@ class TrainConfig:
     model_preset: str = "small"  # "tiny", "small", "medium", "large", or "custom"
     num_experts: int | None = None  # Override num_experts if set
     num_experts_per_tok: int | None = None  # Override if set
+    attention_type: str | None = None  # Override attention backend if set
+    moe_kernel: str | None = None  # Override MoE kernel if set
 
     # Data
     dataset_name: str = "nvidia/Nemotron-CC-Math-v1"
@@ -179,10 +181,16 @@ def main(cfg: TrainConfig) -> None:
         model_config.num_experts = cfg.num_experts
     if cfg.num_experts_per_tok is not None:
         model_config.num_experts_per_tok = cfg.num_experts_per_tok
+    if cfg.attention_type is not None:
+        model_config.attention_type = cfg.attention_type
+    if cfg.moe_kernel is not None:
+        model_config.moe_kernel = cfg.moe_kernel
 
     log(f"Model config: {cfg.model_preset}")
     log(f"  num_experts: {model_config.num_experts}")
     log(f"  num_experts_per_tok: {model_config.num_experts_per_tok}")
+    log(f"  attention_type: {model_config.attention_type}")
+    log(f"  moe_kernel: {model_config.moe_kernel}")
     log(f"  hidden_size: {model_config.hidden_size}")
     log(f"  num_layers: {model_config.num_layers}")
     log(f"  Total params: ~{model_config.num_total_params / 1e6:.1f}M")
