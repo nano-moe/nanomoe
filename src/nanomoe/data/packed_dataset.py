@@ -15,6 +15,7 @@ from typing import Any
 import torch
 from torch import Tensor
 
+from nanomoe.data.packing import PackedBatchCollator
 from nanomoe.data.types import PackedBatch
 
 
@@ -285,6 +286,7 @@ class PackedPretrainStreamGroup:
         total_shards: int,
         shard_base_index: int,
         seq_len: int = 8192,
+        max_examples: int | None = None,
         **kwargs: Any,
     ):
         if not hasattr(hf_dataset, "shard"):
@@ -297,6 +299,8 @@ class PackedPretrainStreamGroup:
         self.streams: list[PackedPretrainDataset] = []
         for i in range(num_streams):
             shard = hf_dataset.shard(num_shards=total_shards, index=shard_base_index + i)
+            if max_examples is not None:
+                shard = shard.take(max_examples)
             stream = PackedPretrainDataset(
                 hf_dataset=shard,
                 tokenizer=tokenizer,
@@ -307,8 +311,6 @@ class PackedPretrainStreamGroup:
 
     def __iter__(self) -> Iterator[PackedBatch]:
         """Stop existing streams, restart, and yield collated batches."""
-        from nanomoe.data.packing import PackedBatchCollator
-
         # Stop any existing prefetch threads
         self.stop()
         # Yield from a fresh collator; ensure streams are stopped on exit/error
@@ -336,9 +338,7 @@ def cu_seqlens_to_packing_metadata(cu_seqlens: Tensor) -> tuple[Tensor, Tensor]:
     device = cu_seqlens.device
     seg_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(dtype=torch.long, device=device)
     num_docs = int(seg_lens.shape[0])
-    doc_ids = torch.repeat_interleave(
-        torch.arange(num_docs, device=device), seg_lens
-    ).unsqueeze(0)  # [1, total_tokens]
+    doc_ids = torch.repeat_interleave(torch.arange(num_docs, device=device), seg_lens).unsqueeze(0)  # [1, total_tokens]
     packing_seq_lens = cu_seqlens[-1:].to(dtype=torch.long)
     return doc_ids, packing_seq_lens
 

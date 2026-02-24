@@ -34,7 +34,7 @@ class TrainConfig:
     dataset_split: str = "train_sft"
     input_key: str = "messages"
     tokenizer_name: str = "Qwen/Qwen2.5-0.5B"
-    seq_len: int = 2048  # Total tokens per packed sequence (not per document -- see max_seq_len)
+    packed_seq_len: int = 2048  # Target tokens per packed sequence; max_seq_len controls per-document truncation
     max_seq_len: int | None = None
 
     # Training
@@ -137,7 +137,7 @@ def main() -> None:
         floor_lr=cfg.floor_lr,
         warmup_steps=cfg.warmup_steps,
         sustain_tokens=0,
-        decay_tokens=cfg.max_tokens or cfg.max_steps * cfg.seq_len * cfg.gradient_accumulation,
+        decay_tokens=cfg.max_tokens or cfg.max_steps * cfg.packed_seq_len * cfg.gradient_accumulation,
     )
     scheduler = WSDScheduler(optimizer, lr_config)
 
@@ -153,7 +153,7 @@ def main() -> None:
 
     hf_dataset = datasets.load_dataset(cfg.dataset_name, split=cfg.dataset_split, streaming=True)
     sft_config = SFTDatasetConfig(
-        seq_len=cfg.seq_len,
+        packed_seq_len=cfg.packed_seq_len,
         max_seq_len=cfg.max_seq_len,
         input_key=cfg.input_key,
         seed=cfg.seed,

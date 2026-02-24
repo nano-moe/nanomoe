@@ -4,7 +4,6 @@ import torch
 
 from nanomoe.data.packed_dataset import (
     PackedPretrainDataset,
-    PackedPretrainStreamGroup,
     cu_seqlens_to_packing_metadata,
 )
 from nanomoe.data.packing import PackedBatchCollator, collate_packed_batches, pack_sequences
@@ -79,14 +78,14 @@ class TestCollatePackedBatches:
         b2 = _make_batch([3, 4], [0, 2])  # no labels
         try:
             collate_packed_batches([b1, b2])
-            assert False, "Should have raised ValueError"
+            raise AssertionError("Should have raised ValueError")
         except ValueError as e:
             assert "labels" in str(e)
 
     def test_empty_raises(self):
         try:
             collate_packed_batches([])
-            assert False, "Should have raised ValueError"
+            raise AssertionError("Should have raised ValueError")
         except ValueError:
             pass
 
@@ -159,7 +158,7 @@ class TestPretrainValidation:
 
         try:
             validate_pretrain_config(cfg, model_config)
-            assert False, "Should have raised ValueError"
+            raise AssertionError("Should have raised ValueError")
         except ValueError as e:
             assert "fsdp_attention" in str(e)
 
@@ -183,7 +182,7 @@ class TestPretrainValidation:
 
         try:
             validate_pretrain_config(cfg, model_config)
-            assert False, "Should have raised ValueError"
+            raise AssertionError("Should have raised ValueError")
         except ValueError as e:
             assert "batch_size" in str(e)
 
@@ -205,7 +204,7 @@ class TestCollateInvariantValidation:
         )
         try:
             collate_packed_batches([b1, b2])
-            assert False, "Should have raised ValueError"
+            raise AssertionError("Should have raised ValueError")
         except ValueError as e:
             assert "Dtype" in str(e)
 
@@ -219,7 +218,7 @@ class TestCollateInvariantValidation:
         )
         try:
             collate_packed_batches([b])
-            assert False, "Should have raised ValueError"
+            raise AssertionError("Should have raised ValueError")
         except ValueError as e:
             assert "position_ids" in str(e)
 
@@ -233,7 +232,7 @@ class TestCollateInvariantValidation:
         )
         try:
             collate_packed_batches([b])
-            assert False, "Should have raised ValueError"
+            raise AssertionError("Should have raised ValueError")
         except ValueError as e:
             assert "token_weights" in str(e)
 
@@ -247,7 +246,7 @@ class TestCollateInvariantValidation:
         )
         try:
             collate_packed_batches([b])
-            assert False, "Should have raised ValueError"
+            raise AssertionError("Should have raised ValueError")
         except ValueError as e:
             assert "cu_seqlens" in str(e)
 
@@ -262,7 +261,7 @@ class TestCollateInvariantValidation:
         )
         try:
             collate_packed_batches([b])
-            assert False, "Should have raised ValueError"
+            raise AssertionError("Should have raised ValueError")
         except ValueError as e:
             assert "labels" in str(e)
 
@@ -277,7 +276,7 @@ class TestCollateInvariantValidation:
         )
         try:
             collate_packed_batches([b])
-            assert False, "Should have raised ValueError"
+            raise AssertionError("Should have raised ValueError")
         except ValueError as e:
             assert "rewards" in str(e)
 
@@ -291,7 +290,7 @@ class TestCollateInvariantValidation:
         )
         try:
             collate_packed_batches([b])
-            assert False, "Should have raised ValueError"
+            raise AssertionError("Should have raised ValueError")
         except ValueError as e:
             assert "monoton" in str(e).lower()
 
@@ -305,7 +304,7 @@ class TestCollateInvariantValidation:
         )
         try:
             collate_packed_batches([b])
-            assert False, "Should have raised ValueError"
+            raise AssertionError("Should have raised ValueError")
         except ValueError as e:
             assert "start at 0" in str(e)
 
@@ -327,7 +326,7 @@ class TestCollateInvariantValidation:
         )
         try:
             collate_packed_batches([b1, b2])
-            assert False, "Should have raised ValueError"
+            raise AssertionError("Should have raised ValueError")
         except ValueError as e:
             assert "log_probs" in str(e)
 
@@ -349,7 +348,7 @@ class TestCollateInvariantValidation:
         )
         try:
             collate_packed_batches([b1, b2])
-            assert False, "Should have raised ValueError"
+            raise AssertionError("Should have raised ValueError")
         except ValueError as e:
             assert "rewards" in str(e)
 

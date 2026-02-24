@@ -4,6 +4,7 @@ Moe kernel implementations.
 Partially adapted from:
 https://github.com/huggingface/transformers/blob/main/src/transformers/integrations/moe.py
 """
+
 import torch
 import torch.nn.functional as F
 
@@ -45,6 +46,7 @@ def _grouped_linear(
 
     return out
 
+
 def eager_mm_experts_forward(
     self: torch.nn.Module,
     hidden_states: torch.Tensor,
@@ -54,15 +56,12 @@ def eager_mm_experts_forward(
     device = hidden_states.device
     num_top_k = top_k_index.size(-1)
     num_tokens = hidden_states.size(0)
-    hidden_dim = hidden_states.size(-1)
 
     # Reshape for easier indexing
     # S is the number of selected tokens-experts pairs (S = num_tokens * num_top_k)
     token_idx = torch.arange(num_tokens, device=device).unsqueeze(1).expand(-1, num_top_k).reshape(-1)  # (S,)
     sample_weights = top_k_weights.reshape(-1)  # (S,)
     expert_ids = top_k_index.reshape(-1)  # (S,)
-
-    # Get current hidden states for selected samples
     selected_hidden_states = hidden_states[token_idx]
 
     # Sort by expert for grouped processing
@@ -98,21 +97,14 @@ def eager_mm_experts_forward(
         gate_up_bias = selected_gate_up_bias[i] if selected_gate_up_bias is not None else 0
         gate_down_bias = selected_down_bias[i] if selected_down_bias is not None else 0
         tokens_for_this_expert = selected_hidden_states_g[start_idx:end_idx]
-        expert_out = self._apply_gate(
-            gate_up_fn(tokens_for_this_expert, gate_up) + gate_up_bias
-        )
+        expert_out = self._apply_gate(gate_up_fn(tokens_for_this_expert, gate_up) + gate_up_bias)
         expert_out = down_fn(expert_out, gate_down) + gate_down_bias
         outputs.append(expert_out)
         start_idx = end_idx
     outs = torch.cat(outputs, dim=0) if len(outputs) else selected_hidden_states_g.new_empty(0)
     outs = outs * sample_weights_g.unsqueeze(-1)  # (S, hidden_dim)
     outs = outs[inv_perm]
-    final_out = (
-        outs.view(*top_k_index.shape, -1)
-        .type(top_k_weights.dtype)
-        .sum(dim=1)
-        .type(outs.dtype)
-    )
+    final_out = outs.view(*top_k_index.shape, -1).type(top_k_weights.dtype).sum(dim=1).type(outs.dtype)
     return final_out
 
 
@@ -141,9 +133,6 @@ def grouped_mm_experts_forward_fast(
     token_idx = torch.arange(num_tokens, device=device).repeat_interleave(num_top_k)
     sample_weights = top_k_weights.reshape(-1)  # (S,)
     expert_ids = top_k_index.reshape(-1)  # (S,)
-
-    # Get current hidden states for selected samples
-    selected_hidden_states = hidden_states[token_idx]
 
     # Sort by expert for grouped processing
     perm = torch.argsort(expert_ids)
@@ -187,7 +176,7 @@ def grouped_mm_experts_forward_fast(
     out_per_sample_g = out_per_sample_g * sample_weights_g.unsqueeze(-1)
     # Restore original order
     final = torch.zeros(num_tokens, hidden_dim, device=out_per_sample_g.device, dtype=out_per_sample_g.dtype)
-    final.index_add_(0, token_idx_g, out_per_sample_g) # Source of non-deterministic
+    final.index_add_(0, token_idx_g, out_per_sample_g)  # Source of non-deterministic
     return final.to(hidden_states.dtype)
 
 

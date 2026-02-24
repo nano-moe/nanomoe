@@ -175,6 +175,11 @@ def unpack_batch(packed: PackedBatch) -> list[dict]:
 def collate_packed_batches(batches: Sequence[PackedBatch]) -> PackedBatch:
     """Collate multiple PackedBatch objects from independent streams into one.
 
+    Each stream packs independently to seq_len tokens with its own cu_seqlens,
+    so we collate at the PackedBatch level (not token level). This keeps packing
+    logic per-stream and makes collation a simple concatenation with cu_seqlens
+    offset — streams must not pack across shard boundaries.
+
     Concatenates tokens, position_ids, token_weights, and offsets cu_seqlens
     so document boundaries remain valid across the merged batch.
 
@@ -200,44 +205,29 @@ def collate_packed_batches(batches: Sequence[PackedBatch]) -> PackedBatch:
             if b.tokens.dtype != ref_dtype:
                 raise ValueError(f"Dtype mismatch: batch 0 is {ref_dtype}, batch {i} is {b.tokens.dtype}")
         if b.position_ids.shape[0] != n:
-            raise ValueError(
-                f"Batch {i}: position_ids length {b.position_ids.shape[0]} != tokens length {n}"
-            )
+            raise ValueError(f"Batch {i}: position_ids length {b.position_ids.shape[0]} != tokens length {n}")
         if b.token_weights.shape[0] != n:
-            raise ValueError(
-                f"Batch {i}: token_weights length {b.token_weights.shape[0]} != tokens length {n}"
-            )
+            raise ValueError(f"Batch {i}: token_weights length {b.token_weights.shape[0]} != tokens length {n}")
         if b.labels is not None and b.labels.shape[0] != n:
-            raise ValueError(
-                f"Batch {i}: labels length {b.labels.shape[0]} != tokens length {n}"
-            )
+            raise ValueError(f"Batch {i}: labels length {b.labels.shape[0]} != tokens length {n}")
         cu_end = int(b.cu_seqlens[-1].item())
         if cu_end != n:
-            raise ValueError(
-                f"Batch {i}: cu_seqlens end {cu_end} != tokens length {n}"
-            )
+            raise ValueError(f"Batch {i}: cu_seqlens end {cu_end} != tokens length {n}")
         if int(b.cu_seqlens[0].item()) != 0:
-            raise ValueError(
-                f"Batch {i}: cu_seqlens must start at 0, got {int(b.cu_seqlens[0].item())}"
-            )
+            raise ValueError(f"Batch {i}: cu_seqlens must start at 0, got {int(b.cu_seqlens[0].item())}")
         diffs = b.cu_seqlens[1:] - b.cu_seqlens[:-1]
         if (diffs < 0).any():
-            raise ValueError(
-                f"Batch {i}: cu_seqlens is not monotonically non-decreasing"
-            )
+            raise ValueError(f"Batch {i}: cu_seqlens is not monotonically non-decreasing")
         num_docs = b.cu_seqlens.shape[0] - 1
         if b.rewards is not None and b.rewards.shape[0] != num_docs:
-            raise ValueError(
-                f"Batch {i}: rewards length {b.rewards.shape[0]} != num_docs {num_docs}"
-            )
+            raise ValueError(f"Batch {i}: rewards length {b.rewards.shape[0]} != num_docs {num_docs}")
 
     # Validate optional fields: all-present or all-None
     for field_name in ("labels", "log_probs", "rewards"):
         present = [getattr(b, field_name) is not None for b in batches]
         if any(present) and not all(present):
             raise ValueError(
-                f"Mixed presence of '{field_name}' across batches: "
-                f"got {sum(present)}/{len(batches)} present"
+                f"Mixed presence of '{field_name}' across batches: got {sum(present)}/{len(batches)} present"
             )
 
     # Concatenate tensors

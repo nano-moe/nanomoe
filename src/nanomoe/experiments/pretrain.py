@@ -110,6 +110,30 @@ class TrainConfig:
     assert_stream_shapes: bool = False
 
 
+def _configure_blas(device: torch.device, dtype: torch.dtype) -> None:
+    """Probe half-precision matmul and fall back to cublasLt if needed.
+
+    Raises a loud warning if the default BLAS library fails, so the operator
+    is aware the fallback is active.
+    """
+    if device.type != "cuda" or dtype not in (torch.float16, torch.bfloat16):
+        return
+    try:
+        _a = torch.randn(2, 2, device=device, dtype=dtype)
+        _ = _a @ _a
+        del _a
+    except RuntimeError as e:
+        import sys
+
+        print(
+            f"WARNING: default BLAS failed for {dtype} on {device} ({e}); "
+            "switching to cublasLt. Training will continue but performance may differ.",
+            file=sys.stderr,
+            flush=True,
+        )
+        torch.backends.cuda.preferred_blas_library("cublaslt")
+
+
 def compute_loss(
     model: Any,  # Can be MoETransformer or torch.compile'd version
     batch: PackedBatch,
@@ -175,9 +199,7 @@ def compute_loss(
             for i, sl in enumerate(batch.stream_lengths):
                 metrics[f"stream_{i}_tokens"] = sl
         if assert_stream_shapes:
-            assert all(sl > 0 for sl in batch.stream_lengths), (
-                f"Empty stream detected: {batch.stream_lengths}"
-            )
+            assert all(sl > 0 for sl in batch.stream_lengths), f"Empty stream detected: {batch.stream_lengths}"
 
     return total_loss, metrics
 
@@ -235,15 +257,7 @@ def main(cfg: TrainConfig) -> None:
     if cfg.profile_cuda and device.type != "cuda":
         log("Warning: CUDA profiling requested but CUDA is unavailable; profiling disabled.")
 
-    # Probe half-precision matmul; fall back to cublasLt on driver/toolkit mismatch
-    if device.type == "cuda" and dtype in (torch.float16, torch.bfloat16):
-        try:
-            _a = torch.randn(2, 2, device=device, dtype=dtype)
-            _ = _a @ _a
-            del _a
-        except RuntimeError:
-            torch.backends.cuda.preferred_blas_library("cublaslt")
-            log("Warning: default BLAS failed for half-precision; using cublasLt fallback.")
+    _configure_blas(device, dtype)
 
     # Create model config
     model_config = getattr(MoEConfig, cfg.model_preset)()
@@ -331,17 +345,10 @@ def main(cfg: TrainConfig) -> None:
     log(f"Loading dataset: {cfg.dataset_name}/{cfg.dataset_config}")
     hf_dataset = datasets.load_dataset(cfg.dataset_name, cfg.dataset_config, streaming=True, split="train")
 
-    # Apply max_examples before sharding so the limit is global
-    if cfg.max_examples is not None:
-        if hasattr(hf_dataset, "take"):
-            hf_dataset = hf_dataset.take(cfg.max_examples)
-        else:
-            raise ValueError("Dataset does not support take(); remove max_examples or use a supported dataset")
-
     # Create packed dataset(s)
     stream_group = None
     if cfg.batch_size > 1:
-        # Multi-stream: PackedPretrainStreamGroup owns sharding
+        # Multi-stream: PackedPretrainStreamGroup owns sharding; take() is applied per-shard
         total_shards = world_size * cfg.batch_size
         shard_base = rank * cfg.batch_size
         log(f"Multi-stream: {cfg.batch_size} streams/rank, total_shards={total_shards}, shard_base={shard_base}")
@@ -352,6 +359,7 @@ def main(cfg: TrainConfig) -> None:
             total_shards=total_shards,
             shard_base_index=shard_base,
             seq_len=cfg.seq_len,
+            max_examples=cfg.max_examples,
             max_seq_len=cfg.max_seq_len,
             text_key=cfg.text_key,
             min_doc_len=cfg.min_doc_len,
@@ -362,12 +370,17 @@ def main(cfg: TrainConfig) -> None:
         )
         dataset = stream_group
     else:
-        # Single stream: shard by world_size if distributed
+        # Single stream: shard first, then apply max_examples per-shard
         if dist.is_initialized():
             if hasattr(hf_dataset, "shard"):
                 hf_dataset = hf_dataset.shard(num_shards=world_size, index=rank)
             else:
                 raise ValueError("Dataset does not support sharding for distributed training.")
+        if cfg.max_examples is not None:
+            if hasattr(hf_dataset, "take"):
+                hf_dataset = hf_dataset.take(cfg.max_examples)
+            else:
+                raise ValueError("Dataset does not support take(); remove max_examples or use a supported dataset")
         dataset = PackedPretrainDataset(
             hf_dataset=hf_dataset,
             tokenizer=tokenizer,
@@ -427,7 +440,11 @@ def main(cfg: TrainConfig) -> None:
             data_iter=data_iter,
             data_iter_factory=data_iter_factory,
             step_fn=lambda b: compute_loss(
-                model, b, device, dtype, effective_attention_type,
+                model,
+                b,
+                device,
+                dtype,
+                effective_attention_type,
                 log_stream_shapes=cfg.log_stream_shapes,
                 assert_stream_shapes=cfg.assert_stream_shapes,
             ),
