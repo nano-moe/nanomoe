@@ -11,6 +11,7 @@ This file orients coding agents to the nanomoe repo.
 ## Environment and setup
 - Python >= 3.13.
 - Use `uv` for deps and running code (preferred by existing scripts).
+- Use 'torch>=2.10' for `F.grouped_mm` support
 
 Common setup:
 - `uv sync --dev`

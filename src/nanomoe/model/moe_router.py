@@ -40,6 +40,9 @@ class BaseRouter(nn.Module, ABC):
         self.jitter_noise = config.router_jitter_noise
         self.prob_normalization = prob_normalization
 
+        if self.jitter_noise < 0:
+            raise ValueError(f"router_jitter_noise must be >= 0, got {self.jitter_noise}")
+
         if self.num_experts_per_tok < 1 or self.num_experts_per_tok > self.num_experts:
             msg = (
                 "num_experts_per_tok must satisfy 1 <= num_experts_per_tok <= num_experts, "
@@ -53,24 +56,89 @@ class BaseRouter(nn.Module, ABC):
 
     def normalize_router_logits(self, router_logits: Tensor) -> Tensor:
         """Normalize logits into routing probabilities."""
+        self._validate_router_logits(router_logits)
+        if self.prob_normalization == "softmax":
+            return softmax_normalize(router_logits)
+        if self.prob_normalization == "sigmoid":
+            return sigmoid_normalize(router_logits)
+        raise ValueError(
+            f"Unsupported prob_normalization '{self.prob_normalization}'. Use 'softmax' or 'sigmoid'."
+        )
+
+    def _prepare_hidden_states(self, hidden_states: Tensor) -> Tensor:
+        """Flatten inputs to [num_tokens, hidden_size] and apply optional jitter."""
+        if hidden_states.dim() == 3:
+            hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+        elif hidden_states.dim() != 2:
+            raise ValueError(
+                "hidden_states must be [batch, seq, hidden] or [num_tokens, hidden], "
+                f"got shape {tuple(hidden_states.shape)}"
+            )
+
+        if self.training and self.jitter_noise > 0:
+            low = 1.0 - self.jitter_noise
+            high = 1.0 + self.jitter_noise
+            noise = torch.empty_like(hidden_states).uniform_(low, high)
+            hidden_states = hidden_states * noise
+        return hidden_states
+
+    def _validate_router_logits(self, router_logits: Tensor) -> None:
+        if router_logits.dim() != 2 or router_logits.shape[-1] != self.num_experts:
+            raise ValueError(
+                "router_logits must be [num_tokens, num_experts], "
+                f"got shape {tuple(router_logits.shape)} with num_experts={self.num_experts}"
+            )
+        if not torch.isfinite(router_logits).all():
+            raise ValueError("router_logits contains NaN or Inf values")
 
     def _select_topk(self, router_probs: Tensor) -> tuple[Tensor, Tensor]:
         """Select top-k experts per token and re-normalize top-k weights."""
+        topk_indices = torch.topk(router_probs, self.num_experts_per_tok, dim=-1).indices
+        topk_weights = torch.gather(router_probs, dim=-1, index=topk_indices)
+        denom = topk_weights.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(topk_weights.dtype).eps)
+        topk_weights = topk_weights / denom
+        return topk_indices, topk_weights
 
-    def forward(self, hidden_states: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    def forward(
+        self,
+        hidden_states: Tensor,
+        packing_doc_ids: Tensor | None = None,
+        packing_seq_lens: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
         """Route tokens to experts.
 
         Args:
             hidden_states: [batch, seq, hidden] or [num_tokens, hidden]
+            packing_doc_ids: [batch, seq_len] document IDs for packed sequences
+            packing_seq_lens: [batch] packed sequence lengths
 
         Returns:
             router_logits: [num_tokens, num_experts]
             expert_indices: [num_tokens, num_experts_per_tok]
             expert_weights: [num_tokens, num_experts_per_tok]
         """
+        del packing_doc_ids, packing_seq_lens
+        hidden_states = self._prepare_hidden_states(hidden_states)
+        router_logits = self.compute_router_logits(hidden_states)
+        router_probs = self.normalize_router_logits(router_logits)
+        expert_indices, expert_weights = self._select_topk(router_probs)
+        return router_logits, expert_indices, expert_weights
 
     def compute_aux_loss(self, router_logits: Tensor) -> Tensor:
         """Compute standard load balancing auxiliary loss."""
+        if self.aux_loss_coef <= 0:
+            return router_logits.new_zeros(())
+
+        router_probs = self.normalize_router_logits(router_logits)
+        topk_indices = torch.topk(router_probs, self.num_experts_per_tok, dim=-1).indices
+
+        # For top-k routing, normalize assignment counts by k so load sums to 1.
+        expert_assignments = F.one_hot(topk_indices, num_classes=self.num_experts).to(router_probs.dtype)
+        expert_load = expert_assignments.sum(dim=1).mean(dim=0) / self.num_experts_per_tok
+        expert_importance = router_probs.mean(dim=0)
+
+        aux_loss = self.num_experts * torch.sum(expert_load * expert_importance)
+        return aux_loss * self.aux_loss_coef
 
 
 class LinearRouter(BaseRouter):
@@ -88,10 +156,24 @@ class NaiveTopKRouter(LinearRouter):
     """Naive top-k router (standard softmax + top-k selection)."""
 
 
+class SwitchTop1Router(NaiveTopKRouter):
+    """Switch Transformer style top-1 routing."""
+
+    def __init__(self, config: MoEConfig, *, prob_normalization: str = "softmax"):
+        super().__init__(config, prob_normalization=prob_normalization)
+        self.num_experts_per_tok = 1
+
+
 class StraightThroughTopKRouter(LinearRouter):
     """Top-k hard routing with a straight-through estimator on selected experts."""
 
-    def forward(self, hidden_states: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    def forward(
+        self,
+        hidden_states: Tensor,
+        packing_doc_ids: Tensor | None = None,
+        packing_seq_lens: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        del packing_doc_ids, packing_seq_lens
         hidden_states = self._prepare_hidden_states(hidden_states)
         router_logits = self.compute_router_logits(hidden_states)
         router_probs = self.normalize_router_logits(router_logits)
@@ -128,7 +210,13 @@ class GumbelStraightThroughTopKRouter(LinearRouter):
         u = torch.rand_like(logits).clamp_min(torch.finfo(logits.dtype).eps)
         return -torch.log(-torch.log(u))
 
-    def forward(self, hidden_states: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    def forward(
+        self,
+        hidden_states: Tensor,
+        packing_doc_ids: Tensor | None = None,
+        packing_seq_lens: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        del packing_doc_ids, packing_seq_lens
         hidden_states = self._prepare_hidden_states(hidden_states)
         router_logits = self.compute_router_logits(hidden_states)
         self._validate_router_logits(router_logits)
@@ -144,10 +232,10 @@ class GumbelStraightThroughTopKRouter(LinearRouter):
         hard_mask = torch.zeros_like(sampled_probs).scatter(-1, topk_indices, 1.0)
         ste_probs = hard_mask + sampled_probs - sampled_probs.detach()
 
-        expert_weights = torch.gather(ste_probs, -1, topk_indices)
+        expert_weights = torch.gather(ste_probs, -1, topk_indices) # Normalizing by K
         denom = expert_weights.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(expert_weights.dtype).eps)
         expert_weights = expert_weights / denom
-        return router_logits, topk_indices, torch.ones_like(expert_weights) # No need for weighting as we are doing sampling
+        return router_logits, topk_indices, expert_weights # No need for weighting as we are doing sampling
 
 
 class PolicyGradientRouter(LinearRouter):
@@ -169,7 +257,7 @@ class PolicyGradientRouter(LinearRouter):
         baseline_momentum: float = 0.9,
     ):
         import warnings
-        warnings.warn("NOT READY FOR USE")
+        warnings.warn("NOT READY FOR USE", stacklevel=2)
         super().__init__(config, prob_normalization=prob_normalization)
         if entropy_coef < 0:
             raise ValueError(f"entropy_coef must be >= 0, got {entropy_coef}")
@@ -188,7 +276,13 @@ class PolicyGradientRouter(LinearRouter):
         self._last_sample_log_probs = None
         self._last_entropy = None
 
-    def forward(self, hidden_states: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    def forward(
+        self,
+        hidden_states: Tensor,
+        packing_doc_ids: Tensor | None = None,
+        packing_seq_lens: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        del packing_doc_ids, packing_seq_lens
         hidden_states = self._prepare_hidden_states(hidden_states)
         router_logits = self.compute_router_logits(hidden_states)
         self._validate_router_logits(router_logits)
@@ -266,3 +360,11 @@ class PolicyGradientRouter(LinearRouter):
 SwitchRouter = SwitchTop1Router
 StraightThroughRouter = StraightThroughTopKRouter
 GumbelSoftmaxStraightThroughRouter = GumbelStraightThroughTopKRouter
+
+ROUTER_REGISTRY = {
+    "switch": SwitchRouter,
+    "topk": NaiveTopKRouter,
+    "straight_through": StraightThroughRouter,
+    "gumbel_straight_through": GumbelSoftmaxStraightThroughRouter,
+    "policy_gradient": PolicyGradientRouter,
+}

@@ -12,7 +12,10 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from nanomoe.model.config import MoEConfig
-from nanomoe.model.moe_router import NaiveTopKRouter
+from nanomoe.model.moe_kernel import MOE_KERNEL_REGISTRY
+from nanomoe.model.moe_router import ROUTER_REGISTRY, NaiveTopKRouter
+
+TopKRouter = NaiveTopKRouter
 
 
 class SwiGLU(nn.Module):
@@ -24,23 +27,74 @@ class SwiGLU(nn.Module):
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        packing_doc_ids: Tensor | None = None,
+        packing_seq_lens: Tensor | None = None,
+    ) -> Tensor:
+        del packing_doc_ids, packing_seq_lens
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class Expert(nn.Module):
-    """Single expert FFN."""
+    """Packed expert weights compatible with moe_kernel API."""
 
-    def __init__(self, hidden_size: int, intermediate_size: int):
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        num_experts: int,
+        *,
+        has_bias: bool = False,
+        is_transposed: bool = False,
+        kernel: str = "grouped_mm",
+        init_std: float = 0.02,
+    ) -> None:
         super().__init__()
-        self.ffn = SwiGLU(hidden_size, intermediate_size)
+        self.num_experts = num_experts
+        self.has_bias = has_bias
+        self.is_transposed = is_transposed
+        self.kernel_fn = MOE_KERNEL_REGISTRY[kernel]
 
-    def forward(self, x: Tensor) -> Tensor:
-        return self.ffn(x)
+        gate_up_out = 2 * intermediate_size
+        if is_transposed:
+            self.gate_up_proj = nn.Parameter(torch.empty(num_experts, hidden_size, gate_up_out))
+            self.down_proj = nn.Parameter(torch.empty(num_experts, intermediate_size, hidden_size))
+        else:
+            self.gate_up_proj = nn.Parameter(torch.empty(num_experts, gate_up_out, hidden_size))
+            self.down_proj = nn.Parameter(torch.empty(num_experts, hidden_size, intermediate_size))
 
+        if has_bias:
+            self.gate_up_proj_bias = nn.Parameter(torch.empty(num_experts, gate_up_out))
+            self.down_proj_bias = nn.Parameter(torch.empty(num_experts, hidden_size))
+        else:
+            self.register_parameter("gate_up_proj_bias", None)
+            self.register_parameter("down_proj_bias", None)
 
-class TopKRouter(NaiveTopKRouter):
-    """Backwards-compatible alias for the default naive top-k router."""
+        self.reset_parameters(init_std)
+
+    def reset_parameters(self, init_std: float) -> None:
+        nn.init.normal_(self.gate_up_proj, mean=0.0, std=init_std)
+        nn.init.normal_(self.down_proj, mean=0.0, std=init_std)
+        if self.has_bias:
+            nn.init.zeros_(self.gate_up_proj_bias)
+            nn.init.zeros_(self.down_proj_bias)
+
+    def _apply_gate(self, gate_up_out: Tensor) -> Tensor:
+        gate, up = gate_up_out.chunk(2, dim=-1)
+        return F.silu(gate) * up
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        top_k_index: Tensor,
+        top_k_weights: Tensor,
+        packing_doc_ids: Tensor | None = None,
+        packing_seq_lens: Tensor | None = None,
+    ) -> Tensor:
+        del packing_doc_ids, packing_seq_lens
+        return self.kernel_fn(self, hidden_states, top_k_index, top_k_weights)
 
 
 class MoELayer(nn.Module):
@@ -53,20 +107,42 @@ class MoELayer(nn.Module):
         self.num_experts_per_tok = config.num_experts_per_tok
 
         # Router
-        self.router = TopKRouter(config)
+        self.router = ROUTER_REGISTRY[config.router_type](config)
 
         # Experts
-        self.experts = nn.ModuleList(
-            [Expert(config.hidden_size, config.intermediate_size) for _ in range(config.num_experts)]
+        kernel = config.moe_kernel
+        if kernel == "auto":
+            kernel = "grouped_mm" if hasattr(F, "grouped_mm") else "eager_mm"
+        if kernel not in MOE_KERNEL_REGISTRY:
+            raise ValueError(f"Unsupported moe_kernel: {kernel}. Available: {list(MOE_KERNEL_REGISTRY)}")
+        if kernel != "eager_mm" and not hasattr(F, "grouped_mm"):
+            raise ValueError(
+                f"Requested moe_kernel={kernel}, but torch.nn.functional.grouped_mm is unavailable. "
+                "Use moe_kernel='eager_mm' instead."
+            )
+        self.moe_kernel = kernel
+        self.experts = Expert(
+            config.hidden_size,
+            config.intermediate_size,
+            config.num_experts,
+            has_bias=False,
+            is_transposed=False,
+            kernel=self.moe_kernel,
+            init_std=config.initializer_range,
         )
 
         # Shared expert (always active, if enabled)
         self.shared_expert = None
         if config.shared_expert:
             shared_size = config.shared_expert_intermediate_size or config.intermediate_size
-            self.shared_expert = Expert(config.hidden_size, shared_size)
+            self.shared_expert = SwiGLU(config.hidden_size, shared_size)
 
-    def forward(self, hidden_states: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(
+        self,
+        hidden_states: Tensor,
+        packing_doc_ids: Tensor | None = None,
+        packing_seq_lens: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
         """Forward pass through MoE layer.
 
         Args:
@@ -80,44 +156,36 @@ class MoELayer(nn.Module):
         hidden_states_flat = hidden_states.view(-1, hidden_size)
 
         # Route tokens to experts
-        router_logits, expert_indices, expert_weights = self.router(hidden_states_flat)
+        router_logits, expert_indices, expert_weights = self.router(
+            hidden_states_flat,
+            packing_doc_ids=packing_doc_ids,
+            packing_seq_lens=packing_seq_lens,
+        )
 
         # Compute auxiliary loss
         aux_loss = self.router.compute_aux_loss(router_logits)
 
         # Compute expert outputs
-        # For simplicity, we use a loop over experts
-        # In production, use grouped GEMM or token-expert batching
-        final_output = torch.zeros_like(hidden_states_flat)
-
-        for expert_idx in range(self.num_experts):
-            # Find tokens routed to this expert
-            expert_mask = (expert_indices == expert_idx).any(dim=-1)
-            if not expert_mask.any():
-                continue
-
-            token_indices = expert_mask.nonzero(as_tuple=True)[0]
-            expert_input = hidden_states_flat[token_indices]
-
-            # Compute expert output
-            expert_output = self.experts[expert_idx](expert_input)
-
-            # Get weights for this expert
-            # expert_indices: [num_tokens, num_experts_per_tok]
-            # We need to find which slot (0 to num_experts_per_tok-1) has this expert
-            slot_mask = expert_indices[token_indices] == expert_idx
-            weights = (expert_weights[token_indices] * slot_mask.float()).sum(dim=-1, keepdim=True)
-
-            # Accumulate weighted output
-            final_output[token_indices] += weights * expert_output
+        final_output = self.experts(
+            hidden_states_flat,
+            expert_indices,
+            expert_weights,
+            packing_doc_ids=packing_doc_ids,
+            packing_seq_lens=packing_seq_lens,
+        )
 
         # Add shared expert output if present
         if self.shared_expert is not None:
-            shared_output = self.shared_expert(hidden_states_flat)
+            shared_output = self.shared_expert(
+                hidden_states_flat,
+                packing_doc_ids=packing_doc_ids,
+                packing_seq_lens=packing_seq_lens,
+            )
             # Shared expert gets equal weight to one routed expert
-            final_output = final_output + shared_output / (self.num_experts_per_tok + 1)
+            final_output = final_output + shared_output * self.config.shared_expert_scale
             # Rescale routed experts
-            final_output = final_output * (self.num_experts_per_tok + 1) / self.num_experts_per_tok
+            # final_output = final_output
+            #  * (self.num_experts_per_tok + 1) / self.num_experts_per_tok
 
         return final_output.view(batch_size, seq_len, hidden_size), aux_loss
 
@@ -131,9 +199,21 @@ class DenseFFN(nn.Module):
         intermediate = config.intermediate_size * config.num_experts_per_tok
         self.ffn = SwiGLU(config.hidden_size, intermediate)
 
-    def forward(self, hidden_states: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(
+        self,
+        hidden_states: Tensor,
+        packing_doc_ids: Tensor | None = None,
+        packing_seq_lens: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
         """Forward pass.
 
         Returns output and zero aux_loss (for API compatibility with MoE).
         """
-        return self.ffn(hidden_states), torch.tensor(0.0, device=hidden_states.device)
+        return (
+            self.ffn(
+                hidden_states,
+                packing_doc_ids=packing_doc_ids,
+                packing_seq_lens=packing_seq_lens,
+            ),
+            torch.tensor(0.0, device=hidden_states.device),
+        )
