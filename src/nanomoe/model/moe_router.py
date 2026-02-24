@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Literal
+from typing import Literal, cast
 
 import torch
 import torch.nn as nn
@@ -61,9 +61,7 @@ class BaseRouter(nn.Module, ABC):
             return softmax_normalize(router_logits)
         if self.prob_normalization == "sigmoid":
             return sigmoid_normalize(router_logits)
-        raise ValueError(
-            f"Unsupported prob_normalization '{self.prob_normalization}'. Use 'softmax' or 'sigmoid'."
-        )
+        raise ValueError(f"Unsupported prob_normalization '{self.prob_normalization}'. Use 'softmax' or 'sigmoid'.")
 
     def _prepare_hidden_states(self, hidden_states: Tensor) -> Tensor:
         """Flatten inputs to [num_tokens, hidden_size] and apply optional jitter."""
@@ -232,10 +230,10 @@ class GumbelStraightThroughTopKRouter(LinearRouter):
         hard_mask = torch.zeros_like(sampled_probs).scatter(-1, topk_indices, 1.0)
         ste_probs = hard_mask + sampled_probs - sampled_probs.detach()
 
-        expert_weights = torch.gather(ste_probs, -1, topk_indices) # Normalizing by K
+        expert_weights = torch.gather(ste_probs, -1, topk_indices)  # Normalizing by K
         denom = expert_weights.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(expert_weights.dtype).eps)
         expert_weights = expert_weights / denom
-        return router_logits, topk_indices, expert_weights # No need for weighting as we are doing sampling
+        return router_logits, topk_indices, expert_weights  # No need for weighting as we are doing sampling
 
 
 class PolicyGradientRouter(LinearRouter):
@@ -257,6 +255,7 @@ class PolicyGradientRouter(LinearRouter):
         baseline_momentum: float = 0.9,
     ):
         import warnings
+
         warnings.warn("NOT READY FOR USE", stacklevel=2)
         super().__init__(config, prob_normalization=prob_normalization)
         if entropy_coef < 0:
@@ -289,9 +288,7 @@ class PolicyGradientRouter(LinearRouter):
         router_probs = self.normalize_router_logits(router_logits)
 
         if self.training:
-            expert_indices = torch.multinomial(
-                router_probs, num_samples=self.num_experts_per_tok, replacement=False
-            )
+            expert_indices = torch.multinomial(router_probs, num_samples=self.num_experts_per_tok, replacement=False)
             log_probs = torch.log(router_probs.clamp_min(torch.finfo(router_probs.dtype).eps))
             self._last_sample_log_probs = torch.gather(log_probs, dim=-1, index=expert_indices).sum(dim=-1)
             self._last_entropy = -(router_probs * log_probs).sum(dim=-1)
@@ -337,12 +334,13 @@ class PolicyGradientRouter(LinearRouter):
 
         if use_baseline:
             batch_mean = advantages.mean().detach()
+            reward_baseline = cast(Tensor, self._reward_baseline)
             if self._baseline_initialized:
-                self._reward_baseline.mul_(self.baseline_momentum).add_(batch_mean * (1 - self.baseline_momentum))
+                reward_baseline.mul_(self.baseline_momentum).add_(batch_mean * (1 - self.baseline_momentum))
             else:
-                self._reward_baseline.copy_(batch_mean)
+                reward_baseline.copy_(batch_mean)
                 self._baseline_initialized = True
-            advantages = advantages - self._reward_baseline
+            advantages = advantages - reward_baseline
 
         policy_loss = -(advantages.detach() * log_probs)
         if self.entropy_coef > 0 and self._last_entropy is not None:

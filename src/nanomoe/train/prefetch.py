@@ -4,13 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import fields, is_dataclass, replace
-from typing import Any, TypeVar, cast
+from typing import Any, cast
 
 import torch
 from pydantic import BaseModel, ConfigDict
 from torch import Tensor
-
-T = TypeVar("T")
 
 
 class PrefetchConfig(BaseModel):
@@ -27,7 +25,7 @@ def _pin_tensor(tensor: Tensor, pin_memory: bool) -> Tensor:
     return tensor
 
 
-def _move_to_device(
+def _move_to_device[T](
     obj: T,
     device: torch.device,
     *,
@@ -103,7 +101,7 @@ def _record_stream(obj: Any, stream: torch.cuda.Stream) -> None:
             _record_stream(getattr(obj, field.name), stream)
 
 
-class DevicePrefetcher(Iterator[T]):
+class DevicePrefetcher[T](Iterator[T]):
     """Prefetch next batch to device using a dedicated CUDA stream."""
 
     def __init__(
@@ -164,7 +162,7 @@ class DevicePrefetcher(Iterator[T]):
         return batch
 
 
-def maybe_prefetch(
+def maybe_prefetch[T](
     data_iter: Iterator[T],
     device: torch.device,
     config: PrefetchConfig | None,

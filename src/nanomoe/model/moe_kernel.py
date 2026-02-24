@@ -5,8 +5,22 @@ Partially adapted from:
 https://github.com/huggingface/transformers/blob/main/src/transformers/integrations/moe.py
 """
 
+from typing import Protocol
+
 import torch
 import torch.nn.functional as F
+
+
+class _ExpertModule(Protocol):
+    gate_up_proj: torch.Tensor
+    down_proj: torch.Tensor
+    gate_up_proj_bias: torch.Tensor | None
+    down_proj_bias: torch.Tensor | None
+    num_experts: int
+    is_transposed: bool
+    has_bias: bool
+
+    def _apply_gate(self, gate_up_out: torch.Tensor) -> torch.Tensor: ...
 
 
 def _grouped_linear(
@@ -48,7 +62,7 @@ def _grouped_linear(
 
 
 def eager_mm_experts_forward(
-    self: torch.nn.Module,
+    self: _ExpertModule,
     hidden_states: torch.Tensor,
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
@@ -109,7 +123,7 @@ def eager_mm_experts_forward(
 
 
 def grouped_mm_experts_forward_fast(
-    self: torch.nn.Module,
+    self: _ExpertModule,
     hidden_states: torch.Tensor,
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
@@ -149,8 +163,8 @@ def grouped_mm_experts_forward_fast(
     # Also there were no speedup gains from it in my experiments, even in eager mode.
     selected_gate_up = self.gate_up_proj
     selected_down = self.down_proj
-    selected_gate_up_bias = self.gate_up_proj_bias[expert_ids_g] if self.has_bias else None
-    selected_down_bias = self.down_proj_bias[expert_ids_g] if self.has_bias else None
+    selected_gate_up_bias = self.gate_up_proj_bias[expert_ids_g] if self.gate_up_proj_bias is not None else None
+    selected_down_bias = self.down_proj_bias[expert_ids_g] if self.down_proj_bias is not None else None
 
     # Compute offsets for grouped_mm
     # using histc instead of bincount to avoid cuda graph issues
@@ -161,7 +175,11 @@ def grouped_mm_experts_forward_fast(
 
     # --- Up projection per expert (grouped) ---
     gate_up_out = _grouped_linear(
-        selected_hidden_states_g, selected_gate_up, selected_gate_up_bias, offsets, is_transposed=self.is_transposed
+        selected_hidden_states_g,
+        selected_gate_up,
+        selected_gate_up_bias,
+        offsets,
+        is_transposed=self.is_transposed,
     )  # (S, 2 * intermediate_dim)
 
     # Apply gating
@@ -181,7 +199,7 @@ def grouped_mm_experts_forward_fast(
 
 
 def grouped_mm_experts_forward(
-    self: torch.nn.Module,
+    self: _ExpertModule,
     hidden_states: torch.Tensor,
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
@@ -219,8 +237,8 @@ def grouped_mm_experts_forward(
     # Also there were no speedup gains from it in my experiments, even in eager mode.
     selected_gate_up = self.gate_up_proj
     selected_down = self.down_proj
-    selected_gate_up_bias = self.gate_up_proj_bias[expert_ids_g] if self.has_bias else None
-    selected_down_bias = self.down_proj_bias[expert_ids_g] if self.has_bias else None
+    selected_gate_up_bias = self.gate_up_proj_bias[expert_ids_g] if self.gate_up_proj_bias is not None else None
+    selected_down_bias = self.down_proj_bias[expert_ids_g] if self.down_proj_bias is not None else None
 
     # Compute offsets for grouped_mm
     # using histc instead of bincount to avoid cuda graph issues
@@ -231,7 +249,11 @@ def grouped_mm_experts_forward(
 
     # --- Up projection per expert (grouped) ---
     gate_up_out = _grouped_linear(
-        selected_hidden_states_g, selected_gate_up, selected_gate_up_bias, offsets, is_transposed=self.is_transposed
+        selected_hidden_states_g,
+        selected_gate_up,
+        selected_gate_up_bias,
+        offsets,
+        is_transposed=self.is_transposed,
     )  # (S, 2 * intermediate_dim)
 
     # Apply gating

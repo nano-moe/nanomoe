@@ -25,6 +25,7 @@ Smoke run:
 - CUDA-only tests skip automatically if CUDA is unavailable.
 
 ## Lint / format / type check
+- All-in-one: `uv run pre-commit run --all-files`
 - `uv run ruff check .`
 - `uv run ruff format .`
 - `uv run ty check src`

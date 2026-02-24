@@ -6,6 +6,7 @@ Adapted from slime/backends/fsdp_utils/data_packing.py and verl/utils/seqlen_bal
 import heapq
 import math
 from collections.abc import Iterable, Sequence
+from typing import cast
 
 import torch
 
@@ -236,9 +237,15 @@ def collate_packed_batches(batches: Sequence[PackedBatch]) -> PackedBatch:
     token_weights = torch.cat([b.token_weights for b in batches])
 
     # Optional tensors
-    labels = torch.cat([b.labels for b in batches]) if batches[0].labels is not None else None
-    log_probs = torch.cat([b.log_probs for b in batches]) if batches[0].log_probs is not None else None
-    rewards = torch.cat([b.rewards for b in batches]) if batches[0].rewards is not None else None
+    labels = torch.cat(cast(list[torch.Tensor], [b.labels for b in batches])) if batches[0].labels is not None else None
+    log_probs = (
+        torch.cat(cast(list[torch.Tensor], [b.log_probs for b in batches]))
+        if batches[0].log_probs is not None
+        else None
+    )
+    rewards = (
+        torch.cat(cast(list[torch.Tensor], [b.rewards for b in batches])) if batches[0].rewards is not None else None
+    )
 
     # Offset cu_seqlens: first batch keeps full cu_seqlens, subsequent drop leading 0
     parts = [batches[0].cu_seqlens]

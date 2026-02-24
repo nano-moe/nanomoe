@@ -15,8 +15,9 @@ import torch
 import torch.nn.functional as F
 
 from nanomoe.model.moe_kernel import (
-    eager_mm_experts_forward, grouped_mm_experts_forward,
-    grouped_mm_experts_forward_fast
+    eager_mm_experts_forward,
+    grouped_mm_experts_forward,
+    grouped_mm_experts_forward_fast,
 )
 
 
@@ -38,27 +39,15 @@ class ToyMoEKernel(torch.nn.Module):
         gate_up_out = 2 * intermediate_dim
 
         if is_transposed:
-            self.gate_up_proj = torch.nn.Parameter(
-                torch.randn(num_experts, hidden_dim, gate_up_out)
-            )
-            self.down_proj = torch.nn.Parameter(
-                torch.randn(num_experts, intermediate_dim, hidden_dim)
-            )
+            self.gate_up_proj = torch.nn.Parameter(torch.randn(num_experts, hidden_dim, gate_up_out))
+            self.down_proj = torch.nn.Parameter(torch.randn(num_experts, intermediate_dim, hidden_dim))
         else:
-            self.gate_up_proj = torch.nn.Parameter(
-                torch.randn(num_experts, gate_up_out, hidden_dim)
-            )
-            self.down_proj = torch.nn.Parameter(
-                torch.randn(num_experts, hidden_dim, intermediate_dim)
-            )
+            self.gate_up_proj = torch.nn.Parameter(torch.randn(num_experts, gate_up_out, hidden_dim))
+            self.down_proj = torch.nn.Parameter(torch.randn(num_experts, hidden_dim, intermediate_dim))
 
         if has_bias:
-            self.gate_up_proj_bias = torch.nn.Parameter(
-                torch.randn(num_experts, gate_up_out)
-            )
-            self.down_proj_bias = torch.nn.Parameter(
-                torch.randn(num_experts, hidden_dim)
-            )
+            self.gate_up_proj_bias = torch.nn.Parameter(torch.randn(num_experts, gate_up_out))
+            self.down_proj_bias = torch.nn.Parameter(torch.randn(num_experts, hidden_dim))
         else:
             self.register_parameter("gate_up_proj_bias", None)
             self.register_parameter("down_proj_bias", None)
@@ -123,15 +112,9 @@ def test_grouped_mm_matches_eager_forward_backward(is_transposed: bool, has_bias
     hidden = torch.randn(num_tokens, hidden_dim, device=device, requires_grad=True)
     hidden_ref = hidden.detach().clone().requires_grad_(True)
 
-    top_k_index, top_k_weights = _make_topk(
-        num_tokens, num_experts, num_top_k, device=device
-    )
-    out_grouped = grouped_mm_experts_forward(
-        module, hidden, top_k_index, top_k_weights
-    )
-    out_ref = eager_mm_experts_forward(
-        module_ref, hidden_ref, top_k_index, top_k_weights
-    )
+    top_k_index, top_k_weights = _make_topk(num_tokens, num_experts, num_top_k, device=device)
+    out_grouped = grouped_mm_experts_forward(module, hidden, top_k_index, top_k_weights)
+    out_ref = eager_mm_experts_forward(module_ref, hidden_ref, top_k_index, top_k_weights)
     torch.testing.assert_close(out_grouped, out_ref, rtol=1e-4, atol=1e-4)
 
     loss_grouped = out_grouped.pow(2).mean()
@@ -154,9 +137,7 @@ def test_grouped_mm_matches_eager_forward_backward(is_transposed: bool, has_bias
 
 @pytest.mark.parametrize("is_transposed", [False, True])
 @pytest.mark.parametrize("has_bias", [False, True])
-def test_grouped_mm_fast_matches_eager_and_grouped_on_cuda(
-    is_transposed: bool, has_bias: bool
-) -> None:
+def test_grouped_mm_fast_matches_eager_and_grouped_on_cuda(is_transposed: bool, has_bias: bool) -> None:
     if not hasattr(F, "grouped_mm"):
         pytest.skip("F.grouped_mm is not available")
     if not torch.cuda.is_available():
@@ -185,18 +166,10 @@ def test_grouped_mm_fast_matches_eager_and_grouped_on_cuda(
     hidden_ref = hidden.detach().clone().requires_grad_(True)
     hidden_grouped = hidden.detach().clone().requires_grad_(True)
 
-    top_k_index, top_k_weights = _make_topk(
-        num_tokens, num_experts, num_top_k, device=device
-    )
-    out_grouped_fast = grouped_mm_experts_forward_fast(
-        module, hidden, top_k_index, top_k_weights
-    )
-    out_grouped = grouped_mm_experts_forward(
-        module_grouped, hidden_grouped, top_k_index, top_k_weights
-    )
-    out_ref = eager_mm_experts_forward(
-        module_ref, hidden_ref, top_k_index, top_k_weights
-    )
+    top_k_index, top_k_weights = _make_topk(num_tokens, num_experts, num_top_k, device=device)
+    out_grouped_fast = grouped_mm_experts_forward_fast(module, hidden, top_k_index, top_k_weights)
+    out_grouped = grouped_mm_experts_forward(module_grouped, hidden_grouped, top_k_index, top_k_weights)
+    out_ref = eager_mm_experts_forward(module_ref, hidden_ref, top_k_index, top_k_weights)
     torch.testing.assert_close(out_grouped_fast, out_ref, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(out_grouped_fast, out_grouped, rtol=1e-4, atol=1e-4)
 
@@ -229,7 +202,6 @@ def test_grouped_mm_fast_matches_eager_and_grouped_on_cuda(
         )
 
 
-
 @pytest.mark.skipif(os.getenv("NANOMOE_RUN_PERF") != "1", reason="perf tests opt-in")
 def test_grouped_mm_efficiency_smoke() -> None:
     if not hasattr(torch, "_grouped_mm"):
@@ -257,9 +229,7 @@ def test_grouped_mm_efficiency_smoke() -> None:
     ).to(device)
 
     hidden = torch.randn(num_tokens, hidden_dim, device=device)
-    top_k_index, top_k_weights = _make_topk(
-        num_tokens, num_experts, num_top_k, device=device
-    )
+    top_k_index, top_k_weights = _make_topk(num_tokens, num_experts, num_top_k, device=device)
 
     def run_grouped() -> None:
         grouped_mm_experts_forward(module, hidden, top_k_index, top_k_weights)
@@ -295,9 +265,9 @@ def test_grouped_mm_efficiency_smoke() -> None:
             run_naive()
         torch.cuda.synchronize()
         naive_time = (time.perf_counter() - start) / iters
-    print('grouped_time:', grouped_time)
-    print('grouped_fast_time:', grouped_fast_time)
-    print('eager_time:', naive_time)
+    print("grouped_time:", grouped_time)
+    print("grouped_fast_time:", grouped_fast_time)
+    print("eager_time:", naive_time)
 
 
 @pytest.mark.skipif(os.getenv("NANOMOE_RUN_PERF") != "1", reason="perf tests opt-in")
@@ -327,32 +297,21 @@ def test_grouped_mm_backward_efficiency_and_peak_memory() -> None:
     module_grouped = copy.deepcopy(base_module)
     module_eager = copy.deepcopy(base_module)
 
-    hidden_grouped = torch.randn(
-        num_tokens, hidden_dim, device=device, requires_grad=True
-    )
+    hidden_grouped = torch.randn(num_tokens, hidden_dim, device=device, requires_grad=True)
     hidden_eager = hidden_grouped.detach().clone().requires_grad_(True)
 
-    top_k_index, top_k_weights = _make_topk(
-        num_tokens, num_experts, num_top_k, device=device
-    )
+    top_k_index, top_k_weights = _make_topk(num_tokens, num_experts, num_top_k, device=device)
 
     def run_grouped() -> torch.Tensor:
-        out = grouped_mm_experts_forward(
-            module_grouped, hidden_grouped, top_k_index, top_k_weights
-        )
+        out = grouped_mm_experts_forward(module_grouped, hidden_grouped, top_k_index, top_k_weights)
         return out.pow(2).mean()
 
     def run_grouped_fast() -> torch.Tensor:
-        out = grouped_mm_experts_forward_fast(
-            module_grouped, hidden_grouped, top_k_index, top_k_weights
-        )
+        out = grouped_mm_experts_forward_fast(module_grouped, hidden_grouped, top_k_index, top_k_weights)
         return out.pow(2).mean()
 
-
     def run_eager() -> torch.Tensor:
-        out = _call_eager_or_skip(
-            module_eager, hidden_eager, top_k_index, top_k_weights
-        )
+        out = _call_eager_or_skip(module_eager, hidden_eager, top_k_index, top_k_weights)
         return out.pow(2).mean()
 
     def measure(fn, iters: int = 5) -> tuple[float, int | None]:
@@ -390,10 +349,13 @@ def test_grouped_mm_backward_efficiency_and_peak_memory() -> None:
     eager_time, eager_peak = measure(run_eager)
 
     # Print out for visibility
-    print('==== MoE grouped_mm forward-backward efficiency ====')
-    print('grouped_time:', grouped_time)
-    print('grouped_fast_time:', grouped_fast_time)
-    print('eager_time:', eager_time)
-    print('grouped_peak (MB):', grouped_peak / (1024 * 1024))
-    print('grouped_fast_peak (MB):', grouped_fast_peak / (1024 * 1024))
-    print('eager_peak (MB):', eager_peak / (1024 * 1024))
+    print("==== MoE grouped_mm forward-backward efficiency ====")
+    print("grouped_time:", grouped_time)
+    print("grouped_fast_time:", grouped_fast_time)
+    print("eager_time:", eager_time)
+    assert grouped_peak is not None
+    assert grouped_fast_peak is not None
+    assert eager_peak is not None
+    print("grouped_peak (MB):", grouped_peak / (1024 * 1024))
+    print("grouped_fast_peak (MB):", grouped_fast_peak / (1024 * 1024))
+    print("eager_peak (MB):", eager_peak / (1024 * 1024))

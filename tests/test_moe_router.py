@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
 import pytest
 import torch
 
 from nanomoe.model.config import MoEConfig
 from nanomoe.model.moe_router import (
+    BaseRouter,
     GumbelStraightThroughTopKRouter,
     NaiveTopKRouter,
     PolicyGradientRouter,
@@ -13,7 +16,7 @@ from nanomoe.model.moe_router import (
 )
 
 
-def _router_config(**kwargs: object) -> MoEConfig:
+def _router_config(**kwargs: Any) -> MoEConfig:
     return MoEConfig(
         hidden_size=16,
         intermediate_size=32,
@@ -43,7 +46,7 @@ def test_router_forward_shapes_and_weight_norm(router_cls: type[torch.nn.Module]
     assert expert_indices.shape == (6, config.num_experts_per_tok)
     assert expert_weights.shape == (6, config.num_experts_per_tok)
     torch.testing.assert_close(expert_weights.sum(dim=-1), torch.ones(6), atol=1e-6, rtol=1e-6)
-    assert router.compute_aux_loss(router_logits).shape == torch.Size([])
+    assert cast(BaseRouter, router).compute_aux_loss(router_logits).shape == torch.Size([])
 
 
 def test_gumbel_router_forward_shapes_and_weight_norm() -> None:

@@ -29,7 +29,7 @@ class PackedBatch:
     log_probs: Tensor | None = None  # (total_response_tokens,)
     rewards: Tensor | None = None  # (num_seqs,)
     stream_lengths: list[int] | None = None  # per-stream token counts (set by collation)
-    stream_count: int | None = None          # number of streams in this batch
+    stream_count: int | None = None  # number of streams in this batch
 
     def to(
         self,

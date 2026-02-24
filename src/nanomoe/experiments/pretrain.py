@@ -20,7 +20,6 @@ import torch.distributed as dist
 from torch.cuda.amp import GradScaler
 from transformers import AutoTokenizer
 
-import nanomoe.model.attention as _attn_module
 from nanomoe.data import (
     PackedBatch,
     PackedPretrainDataset,
@@ -217,12 +216,6 @@ def validate_pretrain_config(cfg: TrainConfig, model_config: Any) -> None:
             "fsdp_attention uses a dense O(seq_len^2) mask that is not viable "
             "for multi-stream batches."
         )
-    if model_config.attention_type == "flex_attention":
-        if _attn_module.create_block_mask is None or _attn_module.flex_attention is None:
-            raise RuntimeError(
-                "attention_type='flex_attention' requires torch.nn.attention.flex_attention "
-                "which is not available in this PyTorch build."
-            )
 
 
 def main(cfg: TrainConfig) -> None:
