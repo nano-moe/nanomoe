@@ -245,6 +245,7 @@ class MoEConfig:
             "num_experts_per_tok": self.num_experts_per_tok,
             "shared_expert": self.shared_expert,
             "shared_expert_intermediate_size": self.shared_expert_intermediate_size,
+            "shared_expert_scale": self.shared_expert_scale,
             "router_type": self.router_type,
             "router_aux_loss_coef": self.router_aux_loss_coef,
             "router_jitter_noise": self.router_jitter_noise,

@@ -141,13 +141,18 @@ def test_create_model_honors_attention_type_and_moe_kernel_overrides() -> None:
     assert model.layers[0].mlp.experts.kernel_fn is MOE_KERNEL_REGISTRY["eager_mm"]
 
 
-def test_config_round_trip_includes_attention_type_and_moe_kernel() -> None:
-    config = _model_config(attention_type="flex_attention", moe_kernel="grouped_mm_fast")
+def test_config_round_trip_includes_attention_type_moe_kernel_and_shared_expert_scale() -> None:
+    config = _model_config(
+        attention_type="flex_attention",
+        moe_kernel="grouped_mm_fast",
+        shared_expert_scale=1.7,
+    )
 
     loaded = MoEConfig.from_dict(config.to_dict())
 
     assert loaded.attention_type == "flex_attention"
     assert loaded.moe_kernel == "grouped_mm_fast"
+    assert loaded.shared_expert_scale == 1.7
 
 
 def test_config_rejects_unknown_attention_type() -> None:
