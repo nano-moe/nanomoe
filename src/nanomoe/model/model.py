@@ -32,9 +32,11 @@ class RMSNorm(nn.Module):
         packing_seq_lens: Tensor | None = None,
     ) -> Tensor:
         del packing_doc_ids, packing_seq_lens
+        input_dtype = x.dtype
+        x = x.float()
         variance = x.pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.eps)
-        return self.weight * x
+        return (self.weight * x).to(input_dtype)
 
 
 class TransformerBlock(nn.Module):

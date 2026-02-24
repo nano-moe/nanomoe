@@ -32,12 +32,12 @@ class PackedPretrainDataset:
         dataset = PackedPretrainDataset(
             hf_dataset=load_dataset("HuggingFaceFW/fineweb-edu", streaming=True)["train"],
             tokenizer=tokenizer,
-            pack_size=8192,
+            seq_len=8192,
             prefetch_batches=4,
         )
 
         for batch in dataset:
-            # batch.tokens: [pack_size] packed tokens
+            # batch.tokens: [seq_len] packed tokens
             # batch.cu_seqlens: document boundaries
             loss = train_step(model, batch)
     """
@@ -46,8 +46,8 @@ class PackedPretrainDataset:
         self,
         hf_dataset: Any,  # HuggingFace IterableDataset
         tokenizer: Any,
-        pack_size: int = 8192,
-        max_seq_len: int | None = None,  # Max length per document (None = pack_size)
+        seq_len: int = 8192,  # Total tokens per packed sequence (not per document — see max_seq_len)
+        max_seq_len: int | None = None,  # Max length per document (None = seq_len)
         text_key: str = "text",
         min_doc_len: int = 64,  # Skip very short documents
         prefetch_batches: int = 4,
@@ -58,8 +58,8 @@ class PackedPretrainDataset:
     ):
         self.hf_dataset = hf_dataset
         self.tokenizer = tokenizer
-        self.pack_size = pack_size
-        self.max_seq_len = max_seq_len or pack_size
+        self.seq_len = seq_len
+        self.max_seq_len = max_seq_len or seq_len
         self.text_key = text_key
         self.min_doc_len = min_doc_len
         self.prefetch_batches = prefetch_batches
@@ -108,8 +108,11 @@ class PackedPretrainDataset:
             # Labels are shifted: predict next token
             all_labels.extend(tokens[1:] + [tokens[-1]])  # Last label is ignored anyway
             all_position_ids.extend(range(seq_len))
-            # Loss on all tokens except first (no previous context)
-            all_token_weights.extend([0.0] + [1.0] * (seq_len - 1))
+            # Loss on all tokens except first (no previous context) and last
+            # (label is a duplicate filler — no valid next token to predict)
+            weights = [0.0] + [1.0] * (seq_len - 1)
+            weights[-1] = 0.0
+            all_token_weights.extend(weights)
             cu_seqlens.append(cu_seqlens[-1] + seq_len)
 
         return PackedBatch(
@@ -147,16 +150,18 @@ class PackedPretrainDataset:
 
                 self._samples_seen += 1
 
-                # Check if adding this doc would exceed pack_size
-                if current_tokens + len(tokens) > self.pack_size and current_pack:
-                    # Pack current documents and yield
+                # Check if adding this doc would exceed seq_len
+                if current_tokens + len(tokens) > self.seq_len and current_pack:
+                    # Pack current documents and put into queue
                     batch = self._pack_documents(current_pack)
-                    try:
-                        self._queue.put(batch, timeout=1.0)
-                    except queue.Full:
-                        if self._stop_event.is_set():
-                            return
-                        continue
+                    while not self._stop_event.is_set():
+                        try:
+                            self._queue.put(batch, timeout=1.0)
+                            break
+                        except queue.Full:
+                            continue
+                    else:
+                        return
 
                     current_pack = []
                     current_tokens = 0
@@ -167,7 +172,17 @@ class PackedPretrainDataset:
 
         except Exception as e:
             self._error = e
-            self._queue.put(None)  # Signal error
+            # Best-effort signal: try to drain one slot then enqueue sentinel.
+            # If put still fails after timeout, _error is set and the main
+            # thread will notice on its next queue.get() timeout cycle.
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._queue.put(None, timeout=5.0)
+            except queue.Full:
+                pass
 
     def start(self):
         """Start the prefetch thread."""
@@ -181,6 +196,8 @@ class PackedPretrainDataset:
 
     def stop(self):
         """Stop the prefetch thread."""
+        if not hasattr(self, "_stop_event"):
+            return
         self._stop_event.set()
         if self._prefetch_thread is not None:
             self._prefetch_thread.join(timeout=5.0)
@@ -241,6 +258,89 @@ class PackedPretrainDataset:
         """Restore state from checkpoint."""
         self._epoch = state.get("epoch", 0)
         self._samples_seen = state.get("samples_seen", 0)
+
+
+class PackedPretrainStreamGroup:
+    """Multi-stream packed dataset that shards data across N independent streams.
+
+    Each stream is a separate PackedPretrainDataset with its own shard of the
+    HF dataset. Streams are collated into a single PackedBatch per iteration step
+    via PackedBatchCollator.
+
+    Args:
+        hf_dataset: HuggingFace IterableDataset (before sharding).
+        tokenizer: Tokenizer instance.
+        num_streams: Number of parallel streams (= batch_size).
+        total_shards: Total shards across all ranks and streams (world_size * batch_size).
+        shard_base_index: First shard index for this rank (rank * batch_size).
+        seq_len: Total tokens per packed sequence per stream.
+        **kwargs: Passed through to PackedPretrainDataset (max_seq_len, text_key, etc.).
+    """
+
+    def __init__(
+        self,
+        hf_dataset: Any,
+        tokenizer: Any,
+        num_streams: int,
+        total_shards: int,
+        shard_base_index: int,
+        seq_len: int = 8192,
+        **kwargs: Any,
+    ):
+        if not hasattr(hf_dataset, "shard"):
+            raise ValueError(
+                "Dataset does not support .shard(); cannot create multi-stream group. "
+                "Use a HuggingFace IterableDataset that supports sharding."
+            )
+
+        self.num_streams = num_streams
+        self.streams: list[PackedPretrainDataset] = []
+        for i in range(num_streams):
+            shard = hf_dataset.shard(num_shards=total_shards, index=shard_base_index + i)
+            stream = PackedPretrainDataset(
+                hf_dataset=shard,
+                tokenizer=tokenizer,
+                seq_len=seq_len,
+                **kwargs,
+            )
+            self.streams.append(stream)
+
+    def __iter__(self) -> Iterator[PackedBatch]:
+        """Stop existing streams, restart, and yield collated batches."""
+        from nanomoe.data.packing import PackedBatchCollator
+
+        # Stop any existing prefetch threads
+        self.stop()
+        # Yield from a fresh collator; ensure streams are stopped on exit/error
+        try:
+            yield from PackedBatchCollator(self.streams)
+        finally:
+            self.stop()
+
+    def stop(self) -> None:
+        """Stop all stream prefetch threads."""
+        for stream in self.streams:
+            stream.stop()
+
+
+def cu_seqlens_to_packing_metadata(cu_seqlens: Tensor) -> tuple[Tensor, Tensor]:
+    """Convert cu_seqlens to packing_doc_ids and packing_seq_lens for flex_attention.
+
+    Args:
+        cu_seqlens: [num_docs + 1] cumulative sequence lengths
+
+    Returns:
+        packing_doc_ids:  [1, total_tokens] — unique doc ID per token
+        packing_seq_lens: [1] — total token count (no padding)
+    """
+    device = cu_seqlens.device
+    seg_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(dtype=torch.long, device=device)
+    num_docs = int(seg_lens.shape[0])
+    doc_ids = torch.repeat_interleave(
+        torch.arange(num_docs, device=device), seg_lens
+    ).unsqueeze(0)  # [1, total_tokens]
+    packing_seq_lens = cu_seqlens[-1:].to(dtype=torch.long)
+    return doc_ids, packing_seq_lens
 
 
 def create_document_mask(cu_seqlens: Tensor, dtype: torch.dtype = torch.bfloat16) -> Tensor:

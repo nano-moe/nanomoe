@@ -159,7 +159,7 @@ class TestPackedSFTDataset:
             ]
         )
         tokenizer = DummyTokenizer()
-        config = SFTDatasetConfig(pack_size=5, max_seq_len=5, min_seq_len=1, input_key="messages", seed=0)
+        config = SFTDatasetConfig(seq_len=5, max_seq_len=5, min_seq_len=1, input_key="messages", seed=0)
         sft = PackedSFTDataset(hf_dataset=dataset, tokenizer=tokenizer, config=config)
 
         batch = next(iter(sft))

@@ -8,6 +8,7 @@ Features:
 - Packs sequences to 8k tokens with document masking (cu_seqlens)
 - Uses custom MoE model or HuggingFace model
 - Supports gradient accumulation, checkpointing, wandb logging
+- Multi-stream packed batches (batch_size > 1) with flex_attention
 """
 
 from typing import Any
@@ -19,7 +20,16 @@ import torch.distributed as dist
 from torch.cuda.amp import GradScaler
 from transformers import AutoTokenizer
 
-from nanomoe.data import PackedBatch, PackedPretrainDataset, create_document_mask
+import nanomoe.model.attention as _attn_module
+from nanomoe.data import (
+    PackedBatch,
+    PackedPretrainDataset,
+    create_document_mask,
+)
+from nanomoe.data.packed_dataset import (
+    PackedPretrainStreamGroup,
+    cu_seqlens_to_packing_metadata,
+)
 from nanomoe.model import MoEConfig, create_model
 from nanomoe.train import (
     Checkpointer,
@@ -43,14 +53,14 @@ class TrainConfig:
     model_preset: str = "small"  # "tiny", "small", "medium", "large", or "custom"
     num_experts: int | None = None  # Override num_experts if set
     num_experts_per_tok: int | None = None  # Override if set
-    attention_type: str | None = None  # Override attention backend if set
+    attention_type: str | None = "flex_attention"  # Override attention backend if set
     moe_kernel: str | None = None  # Override MoE kernel if set
 
     # Data
     dataset_name: str = "nvidia/Nemotron-CC-Math-v1"
     dataset_config: str = "4plus"
     tokenizer_name: str = "Qwen/Qwen3-0.6B"
-    pack_size: int = 8192
+    seq_len: int = 8192  # Total tokens per packed sequence (not per document — see max_seq_len)
     max_seq_len: int | None = None
     text_key: str = "text"
     min_doc_len: int = 64
@@ -60,8 +70,8 @@ class TrainConfig:
     max_examples: int | None = None  # Limit streaming dataset (useful for overfit)
 
     # Training
-    batch_size: int = 1  # Micro batch size (packed sequences)
-    gradient_accumulation: int = 8
+    batch_size: int = 2  # Streams per rank (≈ batch_size * seq_len tokens; packs may be shorter)
+    gradient_accumulation: int = 1
     max_steps: int = 1000
     max_tokens: int | None = None  # Stop after this many tokens (overrides max_steps)
 
@@ -95,32 +105,48 @@ class TrainConfig:
     profile_start_step: int = 1
     profile_steps: int = 5
 
+    # Debug
+    log_stream_shapes: bool = False
+    assert_stream_shapes: bool = False
+
 
 def compute_loss(
     model: Any,  # Can be MoETransformer or torch.compile'd version
     batch: PackedBatch,
     device: torch.device,
     dtype: torch.dtype,
+    attention_type: str,
+    log_stream_shapes: bool = False,
+    assert_stream_shapes: bool = False,
 ) -> tuple[torch.Tensor, dict]:
     """Compute cross-entropy loss with document masking."""
     # Move batch to device if not already prefetched.
     if batch.tokens.device != device:
         batch = batch.to(device, non_blocking=True)
 
-    # Create document-aware attention mask
-    attention_mask = create_document_mask(batch.cu_seqlens, dtype=dtype)
-
-    # Forward pass
     # Reshape for batch dim
     input_ids = batch.tokens.unsqueeze(0)  # [1, seq_len]
     position_ids = batch.position_ids.unsqueeze(0)  # [1, seq_len]
 
-    outputs = model(
-        input_ids=input_ids,
-        position_ids=position_ids,
-        attention_mask=attention_mask,
-        use_cache=False,
-    )
+    # Branch on attention type
+    if attention_type == "flex_attention":
+        doc_ids, seq_lens = cu_seqlens_to_packing_metadata(batch.cu_seqlens)
+        outputs = model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            packing_doc_ids=doc_ids,
+            packing_seq_lens=seq_lens,
+            use_cache=False,
+        )
+    else:
+        # fsdp_attention path: dense 4D mask
+        attention_mask = create_document_mask(batch.cu_seqlens, dtype=dtype)
+        outputs = model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+        )
 
     logits = outputs.logits[0]  # [seq_len, vocab]
     aux_loss = outputs.aux_loss
@@ -141,7 +167,40 @@ def compute_loss(
         "num_docs": len(batch.cu_seqlens) - 1,
     }
 
+    # Stream shape metrics
+    if batch.stream_lengths is not None:
+        metrics["stream_count"] = batch.stream_count
+        metrics["total_tokens"] = sum(batch.stream_lengths)
+        if log_stream_shapes:
+            for i, sl in enumerate(batch.stream_lengths):
+                metrics[f"stream_{i}_tokens"] = sl
+        if assert_stream_shapes:
+            assert all(sl > 0 for sl in batch.stream_lengths), (
+                f"Empty stream detected: {batch.stream_lengths}"
+            )
+
     return total_loss, metrics
+
+
+def validate_pretrain_config(cfg: TrainConfig, model_config: Any) -> None:
+    """Validate batch_size + attention_type combination.
+
+    Raises ValueError/RuntimeError on invalid configurations.
+    """
+    if cfg.batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {cfg.batch_size}")
+    if cfg.batch_size > 1 and model_config.attention_type == "fsdp_attention":
+        raise ValueError(
+            "batch_size > 1 requires attention_type='flex_attention'. "
+            "fsdp_attention uses a dense O(seq_len^2) mask that is not viable "
+            "for multi-stream batches."
+        )
+    if model_config.attention_type == "flex_attention":
+        if _attn_module.create_block_mask is None or _attn_module.flex_attention is None:
+            raise RuntimeError(
+                "attention_type='flex_attention' requires torch.nn.attention.flex_attention "
+                "which is not available in this PyTorch build."
+            )
 
 
 def main(cfg: TrainConfig) -> None:
@@ -164,6 +223,7 @@ def main(cfg: TrainConfig) -> None:
 
     # Device and dtype
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     dtype_map = {
         "float32": torch.float32,
         "float16": torch.float16,
@@ -175,6 +235,16 @@ def main(cfg: TrainConfig) -> None:
     if cfg.profile_cuda and device.type != "cuda":
         log("Warning: CUDA profiling requested but CUDA is unavailable; profiling disabled.")
 
+    # Probe half-precision matmul; fall back to cublasLt on driver/toolkit mismatch
+    if device.type == "cuda" and dtype in (torch.float16, torch.bfloat16):
+        try:
+            _a = torch.randn(2, 2, device=device, dtype=dtype)
+            _ = _a @ _a
+            del _a
+        except RuntimeError:
+            torch.backends.cuda.preferred_blas_library("cublaslt")
+            log("Warning: default BLAS failed for half-precision; using cublasLt fallback.")
+
     # Create model config
     model_config = getattr(MoEConfig, cfg.model_preset)()
     if cfg.num_experts is not None:
@@ -185,6 +255,8 @@ def main(cfg: TrainConfig) -> None:
         model_config.attention_type = cfg.attention_type
     if cfg.moe_kernel is not None:
         model_config.moe_kernel = cfg.moe_kernel
+
+    validate_pretrain_config(cfg, model_config)
 
     log(f"Model config: {cfg.model_preset}")
     log(f"  num_experts: {model_config.num_experts}")
@@ -237,7 +309,7 @@ def main(cfg: TrainConfig) -> None:
         floor_lr=cfg.floor_lr,
         warmup_steps=cfg.warmup_steps,
         sustain_tokens=0,
-        decay_tokens=cfg.max_tokens or cfg.max_steps * cfg.pack_size * cfg.batch_size * cfg.gradient_accumulation,
+        decay_tokens=cfg.max_tokens or cfg.max_steps * cfg.seq_len * cfg.batch_size * cfg.gradient_accumulation,
     )
     scheduler = WSDScheduler(optimizer, lr_config)
 
@@ -258,30 +330,56 @@ def main(cfg: TrainConfig) -> None:
     # Load dataset
     log(f"Loading dataset: {cfg.dataset_name}/{cfg.dataset_config}")
     hf_dataset = datasets.load_dataset(cfg.dataset_name, cfg.dataset_config, streaming=True, split="train")
-    if dist.is_initialized():
-        if hasattr(hf_dataset, "shard"):
-            hf_dataset = hf_dataset.shard(num_shards=world_size, index=rank)
-        else:
-            raise ValueError("Dataset does not support sharding for distributed training.")
+
+    # Apply max_examples before sharding so the limit is global
     if cfg.max_examples is not None:
         if hasattr(hf_dataset, "take"):
             hf_dataset = hf_dataset.take(cfg.max_examples)
         else:
             raise ValueError("Dataset does not support take(); remove max_examples or use a supported dataset")
 
-    # Create packed dataset with prefetching
-    dataset = PackedPretrainDataset(
-        hf_dataset=hf_dataset,
-        tokenizer=tokenizer,
-        pack_size=cfg.pack_size,
-        max_seq_len=cfg.max_seq_len,
-        text_key=cfg.text_key,
-        min_doc_len=cfg.min_doc_len,
-        prefetch_batches=cfg.prefetch_batches,
-        shuffle_buffer=cfg.shuffle_buffer,
-        seed=cfg.seed,
-        add_special_tokens=cfg.add_special_tokens,
-    )
+    # Create packed dataset(s)
+    stream_group = None
+    if cfg.batch_size > 1:
+        # Multi-stream: PackedPretrainStreamGroup owns sharding
+        total_shards = world_size * cfg.batch_size
+        shard_base = rank * cfg.batch_size
+        log(f"Multi-stream: {cfg.batch_size} streams/rank, total_shards={total_shards}, shard_base={shard_base}")
+        stream_group = PackedPretrainStreamGroup(
+            hf_dataset=hf_dataset,
+            tokenizer=tokenizer,
+            num_streams=cfg.batch_size,
+            total_shards=total_shards,
+            shard_base_index=shard_base,
+            seq_len=cfg.seq_len,
+            max_seq_len=cfg.max_seq_len,
+            text_key=cfg.text_key,
+            min_doc_len=cfg.min_doc_len,
+            prefetch_batches=cfg.prefetch_batches,
+            shuffle_buffer=cfg.shuffle_buffer,
+            seed=cfg.seed,
+            add_special_tokens=cfg.add_special_tokens,
+        )
+        dataset = stream_group
+    else:
+        # Single stream: shard by world_size if distributed
+        if dist.is_initialized():
+            if hasattr(hf_dataset, "shard"):
+                hf_dataset = hf_dataset.shard(num_shards=world_size, index=rank)
+            else:
+                raise ValueError("Dataset does not support sharding for distributed training.")
+        dataset = PackedPretrainDataset(
+            hf_dataset=hf_dataset,
+            tokenizer=tokenizer,
+            seq_len=cfg.seq_len,
+            max_seq_len=cfg.max_seq_len,
+            text_key=cfg.text_key,
+            min_doc_len=cfg.min_doc_len,
+            prefetch_batches=cfg.prefetch_batches,
+            shuffle_buffer=cfg.shuffle_buffer,
+            seed=cfg.seed,
+            add_special_tokens=cfg.add_special_tokens,
+        )
 
     # Resume from checkpoint if exists
     resume_step, resume_tokens = checkpointer.load(model_for_checkpoint, optimizer, scheduler)
@@ -293,7 +391,7 @@ def main(cfg: TrainConfig) -> None:
     scaler = GradScaler() if cfg.dtype == "float16" else None
 
     log(f"Starting training for {cfg.max_steps} steps...")
-    log(f"Pack size: {cfg.pack_size}, batch size: {cfg.batch_size}, grad accum: {cfg.gradient_accumulation}")
+    log(f"Seq len: {cfg.seq_len}, batch size: {cfg.batch_size}, grad accum: {cfg.gradient_accumulation}")
 
     loop_cfg = TrainLoopConfig(
         max_steps=cfg.max_steps,
@@ -318,6 +416,9 @@ def main(cfg: TrainConfig) -> None:
         profile_steps=cfg.profile_steps,
     )
 
+    # Capture attention_type for compute_loss closure (avoids DDP unwrapping)
+    effective_attention_type = model_config.attention_type
+
     try:
         data_iter = data_iter_factory()
 
@@ -325,7 +426,11 @@ def main(cfg: TrainConfig) -> None:
             model=model,
             data_iter=data_iter,
             data_iter_factory=data_iter_factory,
-            step_fn=lambda b: compute_loss(model, b, device, dtype),
+            step_fn=lambda b: compute_loss(
+                model, b, device, dtype, effective_attention_type,
+                log_stream_shapes=cfg.log_stream_shapes,
+                assert_stream_shapes=cfg.assert_stream_shapes,
+            ),
             optimizer=optimizer,
             scheduler=scheduler,
             logger=logger,
@@ -340,7 +445,10 @@ def main(cfg: TrainConfig) -> None:
     except KeyboardInterrupt:
         log("\nTraining interrupted by user")
     finally:
-        dataset.stop()
+        if stream_group is not None:
+            stream_group.stop()
+        elif hasattr(dataset, "stop"):
+            dataset.stop()
 
     checkpointer.save(
         step=state.step,

@@ -16,7 +16,7 @@ class DummySampler:
 
 def test_rl_dataset_packs_group():
     prompts = [torch.tensor([1, 2])]
-    cfg = RLDatasetConfig(pack_size=8, max_tokens_per_batch=8)
+    cfg = RLDatasetConfig(seq_len=8, max_tokens_per_batch=8)
     dataset = RLDataset(prompts, DummySampler(), cfg)
 
     batch = next(iter(dataset))

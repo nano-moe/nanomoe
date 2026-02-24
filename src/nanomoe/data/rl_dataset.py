@@ -29,7 +29,7 @@ class ScoredGroup:
 class RLDatasetConfig(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
-    pack_size: int = 4096
+    seq_len: int = 4096  # Total tokens per packed sequence (not per document — see max_seq_len)
     max_tokens_per_batch: int | None = None
     max_attempts: int = 10_000
     reward_std_eps: float = 1e-6
@@ -140,7 +140,7 @@ class RLDataset:
         buffer: list[Sample] = []
         buffer_tokens = 0
         skipped = 0
-        pack_limit = self.config.max_tokens_per_batch or self.config.pack_size
+        pack_limit = self.config.max_tokens_per_batch or self.config.seq_len
 
         while True:
             try:
