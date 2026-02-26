@@ -5,6 +5,8 @@ Adapted from slime/backends/fsdp_utils/data_packing.py and verl/utils/seqlen_bal
 
 import heapq
 import math
+from collections.abc import Iterable, Sequence
+from typing import cast
 
 import torch
 
@@ -135,7 +137,7 @@ def pack_sequences(
         packed = PackedBatch(
             tokens=torch.tensor(flat_tokens, dtype=torch.long),
             labels=torch.tensor(flat_labels, dtype=torch.long) if flat_labels else None,
-            position_ids=torch.tensor(flat_position_ids, dtype=torch.int),
+            position_ids=torch.tensor(flat_position_ids, dtype=torch.long),
             cu_seqlens=torch.tensor(cu_seqlens, dtype=torch.int32),
             token_weights=torch.tensor(flat_token_weights, dtype=torch.float32),
             log_probs=log_probs,
@@ -169,3 +171,126 @@ def unpack_batch(packed: PackedBatch) -> list[dict]:
         )
 
     return sequences
+
+
+def collate_packed_batches(batches: Sequence[PackedBatch]) -> PackedBatch:
+    """Collate multiple PackedBatch objects from independent streams into one.
+
+    Each stream packs independently to seq_len tokens with its own cu_seqlens,
+    so we collate at the PackedBatch level (not token level). This keeps packing
+    logic per-stream and makes collation a simple concatenation with cu_seqlens
+    offset — streams must not pack across shard boundaries.
+
+    Concatenates tokens, position_ids, token_weights, and offsets cu_seqlens
+    so document boundaries remain valid across the merged batch.
+
+    Args:
+        batches: Sequence of PackedBatch from independent streams.
+            All must be on the same device. Optional fields (labels, log_probs,
+            rewards) must be all-present or all-None across batches.
+
+    Returns:
+        A single merged PackedBatch with stream_lengths and stream_count set.
+    """
+    if not batches:
+        raise ValueError("Cannot collate empty sequence of batches")
+
+    # Validate per-batch invariants
+    ref_device = batches[0].tokens.device
+    ref_dtype = batches[0].tokens.dtype
+    for i, b in enumerate(batches):
+        n = b.tokens.shape[0]
+        if i > 0:
+            if b.tokens.device != ref_device:
+                raise ValueError(f"Device mismatch: batch 0 on {ref_device}, batch {i} on {b.tokens.device}")
+            if b.tokens.dtype != ref_dtype:
+                raise ValueError(f"Dtype mismatch: batch 0 is {ref_dtype}, batch {i} is {b.tokens.dtype}")
+        if b.position_ids.shape[0] != n:
+            raise ValueError(f"Batch {i}: position_ids length {b.position_ids.shape[0]} != tokens length {n}")
+        if b.token_weights.shape[0] != n:
+            raise ValueError(f"Batch {i}: token_weights length {b.token_weights.shape[0]} != tokens length {n}")
+        if b.labels is not None and b.labels.shape[0] != n:
+            raise ValueError(f"Batch {i}: labels length {b.labels.shape[0]} != tokens length {n}")
+        cu_end = int(b.cu_seqlens[-1].item())
+        if cu_end != n:
+            raise ValueError(f"Batch {i}: cu_seqlens end {cu_end} != tokens length {n}")
+        if int(b.cu_seqlens[0].item()) != 0:
+            raise ValueError(f"Batch {i}: cu_seqlens must start at 0, got {int(b.cu_seqlens[0].item())}")
+        diffs = b.cu_seqlens[1:] - b.cu_seqlens[:-1]
+        if (diffs < 0).any():
+            raise ValueError(f"Batch {i}: cu_seqlens is not monotonically non-decreasing")
+        num_docs = b.cu_seqlens.shape[0] - 1
+        if b.rewards is not None and b.rewards.shape[0] != num_docs:
+            raise ValueError(f"Batch {i}: rewards length {b.rewards.shape[0]} != num_docs {num_docs}")
+
+    # Validate optional fields: all-present or all-None
+    for field_name in ("labels", "log_probs", "rewards"):
+        present = [getattr(b, field_name) is not None for b in batches]
+        if any(present) and not all(present):
+            raise ValueError(
+                f"Mixed presence of '{field_name}' across batches: got {sum(present)}/{len(batches)} present"
+            )
+
+    # Concatenate tensors
+    tokens = torch.cat([b.tokens for b in batches])
+    position_ids = torch.cat([b.position_ids for b in batches])
+    token_weights = torch.cat([b.token_weights for b in batches])
+
+    # Optional tensors
+    labels = torch.cat(cast(list[torch.Tensor], [b.labels for b in batches])) if batches[0].labels is not None else None
+    log_probs = (
+        torch.cat(cast(list[torch.Tensor], [b.log_probs for b in batches]))
+        if batches[0].log_probs is not None
+        else None
+    )
+    rewards = (
+        torch.cat(cast(list[torch.Tensor], [b.rewards for b in batches])) if batches[0].rewards is not None else None
+    )
+
+    # Offset cu_seqlens: first batch keeps full cu_seqlens, subsequent drop leading 0
+    parts = [batches[0].cu_seqlens]
+    offset = int(batches[0].cu_seqlens[-1].item())
+    for b in batches[1:]:
+        parts.append(b.cu_seqlens[1:] + offset)
+        offset += int(b.cu_seqlens[-1].item())
+    cu_seqlens = torch.cat(parts)
+
+    stream_lengths = [int(b.cu_seqlens[-1].item()) for b in batches]
+
+    return PackedBatch(
+        tokens=tokens,
+        position_ids=position_ids,
+        cu_seqlens=cu_seqlens,
+        token_weights=token_weights,
+        labels=labels,
+        log_probs=log_probs,
+        rewards=rewards,
+        stream_lengths=stream_lengths,
+        stream_count=len(batches),
+    )
+
+
+class PackedBatchCollator:
+    """Iterate over multiple PackedBatch streams, collating one batch from each per step."""
+
+    def __init__(self, streams: Sequence[Iterable[PackedBatch]]):
+        self.streams = streams
+
+    @staticmethod
+    def _close_streams(streams: Sequence) -> None:
+        """Stop any streams that have a stop() method (e.g. PackedPretrainDataset)."""
+        for s in streams:
+            if hasattr(s, "stop"):
+                s.stop()
+
+    def __iter__(self):
+        try:
+            iterators = [iter(s) for s in self.streams]
+            while True:
+                try:
+                    batches = [next(it) for it in iterators]
+                except StopIteration:
+                    return
+                yield collate_packed_batches(batches)
+        finally:
+            self._close_streams(self.streams)

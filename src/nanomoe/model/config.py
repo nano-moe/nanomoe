@@ -75,16 +75,12 @@ class MoEConfig:
         valid_attention_types = {"fsdp_attention", "flex_attention"}
         if self.attention_type not in valid_attention_types:
             raise ValueError(
-                f"Unsupported attention_type: {self.attention_type}. "
-                f"Available: {sorted(valid_attention_types)}"
+                f"Unsupported attention_type: {self.attention_type}. Available: {sorted(valid_attention_types)}"
             )
 
         valid_moe_kernels = {"auto", "eager_mm", "grouped_mm", "grouped_mm_fast"}
         if self.moe_kernel not in valid_moe_kernels:
-            raise ValueError(
-                f"Unsupported moe_kernel: {self.moe_kernel}. "
-                f"Available: {sorted(valid_moe_kernels)}"
-            )
+            raise ValueError(f"Unsupported moe_kernel: {self.moe_kernel}. Available: {sorted(valid_moe_kernels)}")
 
         if self.head_dim is None:
             object.__setattr__(self, "head_dim", self.hidden_size // self.num_attention_heads)

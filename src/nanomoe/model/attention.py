@@ -9,23 +9,19 @@ Features:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-
-try:
-    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
-except Exception:  # pragma: no cover - optional runtime support
-    create_block_mask = None
-    flex_attention = None
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 if TYPE_CHECKING:
     from nanomoe.model.config import MoEConfig
 
 # Adopted from https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/masks/document_mask.py
+
 
 def get_causal_doc_mask(doc_id: Tensor, lengths: Tensor):
     """
@@ -142,6 +138,7 @@ def apply_rope(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor) -> tuple[Tensor, 
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
+
 def _fsdp_attention(
     q: Tensor,
     k: Tensor,
@@ -184,8 +181,6 @@ def _flex_attention(
     packing_seq_lens: Tensor | None,
 ) -> Tensor:
     """Wrapper for flex_attention to handle mask format and causal logic."""
-    if create_block_mask is None or flex_attention is None:
-        raise RuntimeError("torch.nn.attention.flex_attention is not available")
     if packing_doc_ids is None or packing_seq_lens is None:
         raise ValueError("flex_attention requires packing_doc_ids and packing_seq_lens")
 
@@ -198,11 +193,14 @@ def _flex_attention(
         KV_LEN=int(k.shape[2]),
         device=q.device,
     )
-    return flex_attention(
-        q,
-        k,
-        v,
-        block_mask=block_mask,
+    return cast(
+        Tensor,
+        flex_attention(
+            q,
+            k,
+            v,
+            block_mask=block_mask,
+        ),
     )
 
 
@@ -248,8 +246,8 @@ class Attention(nn.Module):
         hidden_states: Tensor,
         attention_mask: Tensor | None = None,
         position_ids: Tensor | None = None,
-        packing_doc_ids: Tensor | None = None, # For packed attention, shape [batch, seq_len]
-        packing_seq_lens: Tensor | None = None, # For packed attention, shape [batch]
+        packing_doc_ids: Tensor | None = None,  # For packed attention, shape [batch, seq_len]
+        packing_seq_lens: Tensor | None = None,  # For packed attention, shape [batch]
         past_key_value: tuple[Tensor, Tensor] | None = None,
         use_cache: bool = False,
     ) -> tuple[Tensor, tuple[Tensor, Tensor] | None]:

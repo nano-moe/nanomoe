@@ -15,7 +15,7 @@ from nanomoe.data.types import PackedBatch, Sample
 class SFTDatasetConfig(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
-    pack_size: int = 2048
+    packed_seq_len: int = 2048  # Target tokens per packed sequence; max_seq_len controls per-document truncation
     max_seq_len: int | None = None
     min_seq_len: int = 16
     input_key: str = "messages"
@@ -37,7 +37,7 @@ class PackedSFTDataset:
         self.tokenizer = tokenizer
         self.config = config or SFTDatasetConfig()
 
-        max_len = self.config.max_seq_len or self.config.pack_size
+        max_len = self.config.max_seq_len or self.config.packed_seq_len
         self._tokenize_fn = tokenize_fn or create_sft_tokenize_fn(tokenizer, max_len, self.config.input_key)
 
         self._epoch = 0
@@ -105,7 +105,7 @@ class PackedSFTDataset:
 
             self._samples_seen += 1
 
-            if current_tokens + len(sample.tokens) > self.config.pack_size and current_pack:
+            if current_tokens + len(sample.tokens) > self.config.packed_seq_len and current_pack:
                 yield self._pack_samples(current_pack)
                 current_pack = []
                 current_tokens = 0

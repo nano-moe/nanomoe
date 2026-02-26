@@ -39,7 +39,7 @@ class SourceSpec(BaseModel):
 class DataBufferConfig(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
-    pack_size: int = 4096
+    packed_seq_len: int = 4096  # Target tokens per packed sequence; max_seq_len controls per-document truncation
     max_tokens_per_batch: int | None = None
     prefetch_batches: int = 0
     seed: int = 42
@@ -125,7 +125,7 @@ class DataBuffer:
         buffer: list[Sample] = []
         buffer_tokens = 0
         attempts = 0
-        pack_limit = self.config.max_tokens_per_batch or self.config.pack_size
+        pack_limit = self.config.max_tokens_per_batch or self.config.packed_seq_len
 
         while True:
             sample = self._next_sample()

@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
 import pytest
 import torch
 import torch.nn.functional as F
 
 import nanomoe.model.attention as attention_mod
 from nanomoe.model.config import MoEConfig
-from nanomoe.model.model import MoETransformer, create_model
+from nanomoe.model.model import MoETransformer, TransformerBlock, create_model
 from nanomoe.model.moe_kernel import MOE_KERNEL_REGISTRY
 
 
-def _model_config(**kwargs: object) -> MoEConfig:
+def _model_config(**kwargs: Any) -> MoEConfig:
     return MoEConfig(
         hidden_size=32,
         num_layers=2,
@@ -29,10 +31,11 @@ def _model_config(**kwargs: object) -> MoEConfig:
 
 def _unwrap_compiled_attention(model: MoETransformer) -> None:
     for layer in model.layers:
-        forward = layer.self_attn.forward
+        tb = cast(TransformerBlock, layer)
+        forward = tb.self_attn.forward
         wrapped = getattr(forward, "__wrapped__", None)
         if wrapped is not None:
-            layer.self_attn.forward = wrapped.__get__(layer.self_attn, type(layer.self_attn))
+            tb.self_attn.forward = wrapped.__get__(tb.self_attn, type(tb.self_attn))
 
 
 def test_moe_transformer_forward_backward_end_to_end() -> None:

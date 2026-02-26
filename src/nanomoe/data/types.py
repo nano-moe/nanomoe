@@ -28,6 +28,8 @@ class PackedBatch:
     labels: Tensor | None = None  # (total_tokens,)
     log_probs: Tensor | None = None  # (total_response_tokens,)
     rewards: Tensor | None = None  # (num_seqs,)
+    stream_lengths: list[int] | None = None  # per-stream token counts (set by collation)
+    stream_count: int | None = None  # number of streams in this batch
 
     def to(
         self,
@@ -52,6 +54,8 @@ class PackedBatch:
             rewards=_maybe_pin(self.rewards).to(device, non_blocking=non_blocking)
             if self.rewards is not None
             else None,
+            stream_lengths=self.stream_lengths,
+            stream_count=self.stream_count,
         )
 
 

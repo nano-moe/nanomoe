@@ -12,16 +12,12 @@ import os
 import time
 import warnings
 from collections.abc import Callable
+from typing import cast
 
 import pytest
 import torch
 import torch.nn.functional as F
-
-try:
-    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
-except Exception:  # pragma: no cover - optional runtime support
-    create_block_mask = None
-    flex_attention = None
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 
 def _doc_ids_from_cu_seqlens(cu_seqlens: torch.Tensor) -> torch.Tensor:
@@ -70,7 +66,9 @@ def _flash_style_attention_with_cu_seqlens(
     return out
 
 
-def _attention_with_4d_mask(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+def _attention_with_4d_mask(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens: torch.Tensor
+) -> torch.Tensor:
     mask = _packed_4d_mask_from_cu_seqlens(cu_seqlens, dtype=q.dtype)
     return F.scaled_dot_product_attention(
         q,
@@ -83,9 +81,6 @@ def _attention_with_4d_mask(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, c
 
 
 def _attention_with_flex(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
-    if create_block_mask is None or flex_attention is None:
-        raise RuntimeError("torch.nn.attention.flex_attention is not available")
-
     total_tokens = int(cu_seqlens[-1].item())
     doc_ids = _doc_ids_from_cu_seqlens(cu_seqlens)
     q_idx = torch.arange(total_tokens, device=cu_seqlens.device).unsqueeze(1)
@@ -107,12 +102,10 @@ def _attention_with_flex(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_s
 
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="flex_attention called without torch.compile")
-        return flex_attention(q, k, v, block_mask=block_mask)
+        return cast(torch.Tensor, flex_attention(q, k, v, block_mask=block_mask))
 
 
-def _benchmark_cuda_ms_and_peak_bytes(
-    fn: Callable[[], torch.Tensor], warmup: int, iters: int
-) -> tuple[float, int]:
+def _benchmark_cuda_ms_and_peak_bytes(fn: Callable[[], torch.Tensor], warmup: int, iters: int) -> tuple[float, int]:
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -166,9 +159,6 @@ def test_packed_attention_cu_seqlens_matches_4d_mask_forward_backward() -> None:
 
 
 def test_packed_attention_cu_seqlens_matches_flex_attention_forward() -> None:
-    if create_block_mask is None or flex_attention is None:
-        pytest.skip("torch.nn.attention.flex_attention is not available")
-
     q, k, v, cu_seqlens = _make_qkv(device=torch.device("cpu"))
 
     out_cu = _flash_style_attention_with_cu_seqlens(q, k, v, cu_seqlens)
@@ -181,8 +171,6 @@ def test_packed_attention_cu_seqlens_matches_flex_attention_forward() -> None:
 def test_packed_attention_runtime_benchmark_cuda() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
-    if create_block_mask is None or flex_attention is None:
-        pytest.skip("torch.nn.attention.flex_attention is not available")
 
     torch.manual_seed(7)
     device = torch.device("cuda")
@@ -236,7 +224,7 @@ def test_packed_attention_runtime_benchmark_cuda() -> None:
     def run_flex() -> torch.Tensor:
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message="flex_attention called without torch.compile")
-            return flex_attention(q, k, v, block_mask=block_mask)
+            return cast(torch.Tensor, flex_attention(q, k, v, block_mask=block_mask))
 
     run_flex_compiled = None
     flex_compile_error = None
@@ -247,7 +235,7 @@ def test_packed_attention_runtime_benchmark_cuda() -> None:
             compiled_flex_attention = torch.compile(flex_attention)
 
             def run_flex_compiled() -> torch.Tensor:
-                return compiled_flex_attention(q, k, v, block_mask=block_mask)
+                return cast(torch.Tensor, compiled_flex_attention(q, k, v, block_mask=block_mask))
         except Exception as exc:  # pragma: no cover - env/backend dependent
             flex_compile_error = exc
         try:
@@ -308,9 +296,9 @@ def test_packed_attention_runtime_benchmark_cuda() -> None:
     print(f"cu_seqlens varlen SDPA: {cu_ms:.3f} ms/iter, peak={cu_peak / (1024 * 1024):.1f} MB")
     print(f"flex attention       : {flex_ms:.3f} ms/iter, peak={flex_peak / (1024 * 1024):.1f} MB")
     if flex_compiled_ms is not None:
+        assert flex_compiled_peak is not None
         print(
-            "flex attention+compile:"
-            f" {flex_compiled_ms:.3f} ms/iter, peak={flex_compiled_peak / (1024 * 1024):.1f} MB"
+            f"flex attention+compile: {flex_compiled_ms:.3f} ms/iter, peak={flex_compiled_peak / (1024 * 1024):.1f} MB"
         )
     elif flex_compile_error is not None:
         print(f"flex attention+compile: unavailable ({type(flex_compile_error).__name__}: {flex_compile_error})")
@@ -318,6 +306,7 @@ def test_packed_attention_runtime_benchmark_cuda() -> None:
         print("flex attention+compile: unavailable (torch.compile not present)")
     print(f"4d attention mask    : {mask4d_ms:.3f} ms/iter, peak={mask4d_peak / (1024 * 1024):.1f} MB")
     if mask4d_compiled_ms is not None:
+        assert mask4d_compiled_peak is not None
         print(
             "4d mask+compile      :"
             f" {mask4d_compiled_ms:.3f} ms/iter, peak={mask4d_compiled_peak / (1024 * 1024):.1f} MB"

@@ -5,7 +5,6 @@ from typing import Any
 
 import datasets
 import torch
-import torch.nn.functional as F
 from torch.cuda.amp import GradScaler
 from transformers import AutoTokenizer
 
@@ -19,6 +18,7 @@ from nanomoe.train import (
     WSDScheduler,
     setup_logging,
     train_loop,
+    unified_loss,
 )
 
 
@@ -34,7 +34,7 @@ class TrainConfig:
     dataset_split: str = "train_sft"
     input_key: str = "messages"
     tokenizer_name: str = "Qwen/Qwen2.5-0.5B"
-    pack_size: int = 2048
+    packed_seq_len: int = 2048  # Target tokens per packed sequence; max_seq_len controls per-document truncation
     max_seq_len: int | None = None
 
     # Training
@@ -86,20 +86,13 @@ def compute_sft_loss(
     if batch.labels is None:
         raise ValueError("PackedBatch.labels is required for SFT")
 
-    shift_logits = logits[:-1]
-    shift_labels = batch.labels[:-1]
-    shift_weights = batch.token_weights[:-1]
-
-    loss = F.cross_entropy(shift_logits, shift_labels, reduction="none")
-    denom = shift_weights.abs().sum().clamp(min=1)
-    masked_loss = (loss * shift_weights).sum() / denom
-
-    total_loss = masked_loss + aux_loss
+    token_loss = unified_loss(logits, batch.labels, batch.token_weights)
+    total_loss = token_loss + aux_loss
 
     metrics = {
-        "loss": masked_loss.item(),
+        "loss": token_loss.item(),
         "aux_loss": aux_loss.item() if isinstance(aux_loss, torch.Tensor) else aux_loss,
-        "num_tokens": shift_weights.ne(0).sum().item(),
+        "num_tokens": batch.token_weights[:-1].abs().sum().item(),
     }
 
     return total_loss, metrics
@@ -144,7 +137,7 @@ def main() -> None:
         floor_lr=cfg.floor_lr,
         warmup_steps=cfg.warmup_steps,
         sustain_tokens=0,
-        decay_tokens=cfg.max_tokens or cfg.max_steps * cfg.pack_size * cfg.gradient_accumulation,
+        decay_tokens=cfg.max_tokens or cfg.max_steps * cfg.packed_seq_len * cfg.gradient_accumulation,
     )
     scheduler = WSDScheduler(optimizer, lr_config)
 
@@ -160,7 +153,7 @@ def main() -> None:
 
     hf_dataset = datasets.load_dataset(cfg.dataset_name, split=cfg.dataset_split, streaming=True)
     sft_config = SFTDatasetConfig(
-        pack_size=cfg.pack_size,
+        packed_seq_len=cfg.packed_seq_len,
         max_seq_len=cfg.max_seq_len,
         input_key=cfg.input_key,
         seed=cfg.seed,

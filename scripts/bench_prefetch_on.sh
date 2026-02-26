@@ -3,7 +3,7 @@ set -euo pipefail
 
 CHECKPOINT_DIR=${CHECKPOINT_DIR:-checkpoints/bench_prefetch_on}
 MAX_STEPS=${MAX_STEPS:-20}
-PACK_SIZE=${PACK_SIZE:-1024}
+SEQ_LEN=${SEQ_LEN:-1024}
 PREFETCH_BATCHES=${PREFETCH_BATCHES:-2}
 DATASET_NAME=${DATASET_NAME:-wikitext}
 DATASET_CONFIG=${DATASET_CONFIG:-wikitext-2-raw-v1}
@@ -20,7 +20,7 @@ uv run python -m nanomoe.experiments.pretrain \
   --max_steps="${MAX_STEPS}" \
   --log_every="${LOG_EVERY}" \
   --model_preset=tiny \
-  --pack_size="${PACK_SIZE}" \
+  --seq_len="${SEQ_LEN}" \
   --prefetch_batches="${PREFETCH_BATCHES}" \
   --dataset_name="${DATASET_NAME}" \
   --dataset_config="${DATASET_CONFIG}" \

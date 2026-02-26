@@ -15,7 +15,7 @@ def test_databuffer_mixes_sources():
         SourceSpec(name="a", source=[_make_sample([1, 2, 3])], weight=1.0),
         SourceSpec(name="b", source=[_make_sample([4, 5, 6])], weight=1.0),
     ]
-    config = DataBufferConfig(max_tokens_per_batch=3, pack_size=3, prefetch_batches=0, seed=0)
+    config = DataBufferConfig(max_tokens_per_batch=3, packed_seq_len=3, prefetch_batches=0, seed=0)
     buf = DataBuffer(sources, config)
 
     batches = list(buf)
@@ -29,7 +29,7 @@ def test_databuffer_skips_zero_weight_samples():
     zero = _make_sample([1, 2, 3], weight=0.0)
     nonzero = _make_sample([4, 5, 6], weight=1.0)
     sources = [SourceSpec(name="a", source=[zero, nonzero], weight=1.0)]
-    config = DataBufferConfig(max_tokens_per_batch=3, pack_size=3, prefetch_batches=0, seed=0)
+    config = DataBufferConfig(max_tokens_per_batch=3, packed_seq_len=3, prefetch_batches=0, seed=0)
     buf = DataBuffer(sources, config)
 
     batches = list(buf)
@@ -42,7 +42,7 @@ def test_databuffer_resume_replays_stream():
         SourceSpec(name="a", source=[_make_sample([1, 2, 3]), _make_sample([7, 8, 9])], weight=1.0),
         SourceSpec(name="b", source=[_make_sample([4, 5, 6]), _make_sample([10, 11, 12])], weight=1.0),
     ]
-    config = DataBufferConfig(max_tokens_per_batch=3, pack_size=3, prefetch_batches=0, seed=123)
+    config = DataBufferConfig(max_tokens_per_batch=3, packed_seq_len=3, prefetch_batches=0, seed=123)
     buf = DataBuffer(sources, config)
 
     it = iter(buf)
