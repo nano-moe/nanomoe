@@ -23,7 +23,6 @@ dependencies = [
     "transformers>=4.57.6",
     "vl-convert-python>=1.9.0",
     "wandb>=0.24.0",
-    "quack-kernels",
 ]
 
 [dependency-groups]
@@ -43,7 +42,6 @@ explicit = true
 torch = [
     { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
 ]
-quack-kernels = { path = "../quack", editable = true }
 
 [build-system]
 requires = ["hatchling"]
