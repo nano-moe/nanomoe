@@ -8,6 +8,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+try:
+    from quack import hull_attn as quack_hull_attn
+except ImportError:
+    quack_hull_attn = None
+
 AttentionBackend = Literal["sdpa", "hullattn"]
 PoolingMode = Literal["last", "mean", "cls"]
 
@@ -129,6 +134,15 @@ class MultiheadSelfAttention(nn.Module):
             raise ValueError(f"hull_eval_top_k must be >= 1, got {top_k}")
         self.hull_eval_top_k = top_k
 
+    def _hull_mode_for_eval(self, seq_len: int) -> str:
+        if self.hull_eval_top_k is None or self.hull_eval_top_k >= seq_len:
+            return "full"
+        if self.hull_eval_top_k == 1:
+            return "topk1"
+        if self.hull_eval_top_k == 4:
+            return "topk4"
+        raise ValueError(f"Unsupported hull_eval_top_k={self.hull_eval_top_k}; expected 1, 4, or >= seq_len")
+
     def forward(self, hidden_states: Tensor, attention_mask: Tensor) -> Tensor:
         if self.config.attention_backend == "hullattn":
             if self.head_dim != 2:
@@ -145,7 +159,21 @@ class MultiheadSelfAttention(nn.Module):
         v = v.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
         if self.config.attention_backend == "hullattn":
-            if not self.training and self.hull_eval_top_k is not None:
+            if quack_hull_attn is not None and q.is_cuda:
+                q = q.contiguous()
+                k = k.contiguous()
+                v = v.contiguous()
+                seq_lens = attention_mask.sum(dim=-1, dtype=torch.int32)
+                attended = quack_hull_attn(
+                    q,
+                    k,
+                    v,
+                    mode="full" if self.training else self._hull_mode_for_eval(seq_len),
+                    scale=(self.head_dim**-0.5) / self.hull_temperature,
+                    seq_lens=seq_lens,
+                )
+                attended = attended * attention_mask[:, None, :, None].to(dtype=attended.dtype)
+            elif not self.training and self.hull_eval_top_k is not None:
                 attended = _hull_sparse_attention_reference(
                     q,
                     k,
