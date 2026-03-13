@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 import torch
 
@@ -56,3 +57,23 @@ def test_load_pathx_dataset_from_local_tree(tmp_path: Path) -> None:
     batch = classification_collate_fn(datasets.pad_value)([datasets.train[0], datasets.train[1]])
     assert batch.inputs.ndim == 3
     assert batch.inputs.shape[-1] == 1
+
+
+def test_load_pathx_dataset_from_binary_npy_metadata(tmp_path: Path) -> None:
+    data_root = tmp_path / "pathfinder" / "pathfinder128" / "curv_contour_length_14"
+    metadata_dir = data_root / "metadata"
+    image_dir = data_root / "imgs" / "1"
+    metadata_dir.mkdir(parents=True)
+    image_dir.mkdir(parents=True)
+
+    for index in range(10):
+        image = Image.new("L", (2, 2), color=index)
+        image.save(image_dir / f"sample_{index}.png")
+
+    rows = np.array([[f"imgs/1", f"sample_{index}.png", str(index), str(index % 2)] for index in range(10)])
+    np.save(metadata_dir / "1.npy", rows)
+
+    datasets = load_lra_datasets("pathx", data_root=tmp_path, max_train_examples=3, max_eval_examples=1, seed=0)
+    assert len(datasets.train) == 3
+    assert len(datasets.val) == 1
+    assert len(datasets.test) == 1

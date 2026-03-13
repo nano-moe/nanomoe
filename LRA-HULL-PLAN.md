@@ -19,6 +19,7 @@ Reference repos:
 Implemented in `nanomoe`:
 - `ListOps` loader
 - `Path-X` loader via Pathfinder-128 sequential grayscale inputs
+- `Path-X` retrieval helper at `scripts/get_lra_data.sh`
 - encoder-only Transformer classifier baseline
 - `python -m nanomoe.experiments.lra`
 - attention backend seam with names:
@@ -27,6 +28,7 @@ Implemented in `nanomoe`:
 
 Verified:
 - `uv run pytest tests/test_lra_data.py tests/test_lra_model.py`
+- `pathx` now loads both text-style metadata fixtures and real binary `.npy` metadata from mirrored Pathfinder-128 drops
 
 Current limitation:
 - `hullattn` now has a correctness-first reference implementation in `nanomoe`.
@@ -71,6 +73,7 @@ Key files:
 Relevant takeaways:
 - `ListOps` uses token remapping consistent with the original LRA preprocessing.
 - `Path-X` is represented through Pathfinder-128 sequential grayscale inputs.
+- the old `lra_release.gz` URL used by older docs may no longer be reliable; keep a mirror fallback for `pathfinder128`
 
 ### `tf2d`
 
@@ -196,6 +199,23 @@ Metrics:
 3. Measure throughput / memory cost versus `sdpa`.
 4. Decide whether to keep the current classifier block or add a small Qwen-lite cleanup pass.
 5. Replace brute-force top-k selection with a real hull-based implementation.
+
+## Dataset bootstrap notes
+
+Path-X source expected by `nanomoe`:
+- `data/pathfinder/pathfinder128/curv_contour_length_14/...`
+- or any alternate root passed via `--data-root` / `NANOMOE_LRA_DATA`
+
+Bootstrap command:
+
+```bash
+./scripts/get_lra_data.sh
+```
+
+Behavior:
+- tries the historical LRA archive first
+- falls back to the public Pathfinder-128 mirror if that archive is unavailable
+- leaves data in the layout already expected by `load_lra_datasets("pathx", ...)`
 
 ## Suggested commands
 

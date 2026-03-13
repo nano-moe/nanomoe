@@ -1,6 +1,10 @@
 .env
 .codex/
 checkpoints/
+data/pathfinder/
+data/lra_release/
+data/lra_release.gz
+wandb/
 
 __pycache__/
 

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+import numpy as np
 import torch
 from datasets import load_dataset
 from PIL import Image
@@ -277,17 +278,32 @@ class PathFinderSequenceDataset(Dataset[ClassificationExample]):
             raise FileNotFoundError(f"No Pathfinder metadata found under {metadata_dir}")
 
         for metadata_file in metadata_files:
-            with open(metadata_file, encoding="utf-8") as handle:
-                for line in handle:
-                    fields = line.split()
-                    if len(fields) < 4:
-                        continue
-                    image_path = Path(diff_level) / fields[0] / fields[1]
-                    blacklist_key = str(Path(data_dir.stem) / image_path)
-                    if blacklist_key in PATHFINDER_BLACKLIST:
-                        continue
-                    samples.append((image_path, int(fields[3])))
+            for fields in self._load_metadata_rows(metadata_file):
+                if len(fields) < 4:
+                    continue
+                image_path = Path(diff_level) / fields[0] / fields[1]
+                blacklist_key = str(Path(data_dir.stem) / image_path)
+                if blacklist_key in PATHFINDER_BLACKLIST:
+                    continue
+                samples.append((image_path, int(fields[3])))
         return samples
+
+    @staticmethod
+    def _load_metadata_rows(metadata_file: Path) -> list[list[str]]:
+        try:
+            array = np.load(metadata_file, allow_pickle=True)
+        except ValueError:
+            array = None
+        except Exception:
+            array = None
+
+        if array is not None:
+            if array.ndim == 1:
+                return [str(row).split() for row in array.tolist()]
+            return [[str(field) for field in row] for row in array.tolist()]
+
+        with open(metadata_file, encoding="utf-8") as handle:
+            return [line.split() for line in handle]
 
     def __len__(self) -> int:
         return len(self.samples)
