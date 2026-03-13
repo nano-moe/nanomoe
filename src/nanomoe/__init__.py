@@ -1,3 +1,3 @@
-from nanomoe import data, model, sample, train
+from nanomoe import data, lra, model, sample, train
 
-__all__ = ["data", "model", "sample", "train"]
+__all__ = ["data", "lra", "model", "sample", "train"]

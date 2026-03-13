@@ -13,6 +13,7 @@ dependencies = [
     "datasets>=4.5.0",
     "hf-transfer>=0.1.9",
     "ipdb>=0.13.13",
+    "pillow>=10.4.0",
     "pydantic>=2.6.0",
     "rich>=14.2.0",
     "tiktoken>=0.12.0",
