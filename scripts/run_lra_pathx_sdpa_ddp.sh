@@ -5,24 +5,22 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-GPU_SET="${GPU_SET:-4,5,6,7}"
+GPU_SET="${GPU_SET:-0,1,2,3}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
-MASTER_PORT="${MASTER_PORT:-29512}"
-DATA_ROOT="${DATA_ROOT:-/home/ubuntu/s4/data_full}"
-LOG_DIR="${LOG_DIR:-checkpoints/lra_full_hullattn}"
+MASTER_PORT="${MASTER_PORT:-29513}"
+DATA_ROOT="${DATA_ROOT:-$repo_root/data}"
+LOG_DIR="${LOG_DIR:-checkpoints/lra_pathx_sdpa}"
 WANDB_PROJECT="${WANDB_PROJECT:-nanomoe-lra}"
-WANDB_NAME="${WANDB_NAME:-listops-hullattn-ddp}"
+WANDB_NAME="${WANDB_NAME:-pathx-sdpa-ddp}"
 WANDB_MODE="${WANDB_MODE:-online}"
 SEED="${SEED:-42}"
 
 D_MODEL="${D_MODEL:-128}"
-NUM_HEADS="${NUM_HEADS:-64}"
+NUM_HEADS="${NUM_HEADS:-8}"
 NUM_LAYERS="${NUM_LAYERS:-8}"
 FFN_HIDDEN_SIZE="${FFN_HIDDEN_SIZE:-512}"
-HULL_TEMPERATURE_START="${HULL_TEMPERATURE_START:-1.0}"
-HULL_TEMPERATURE_END="${HULL_TEMPERATURE_END:-0.3}"
-BATCH_SIZE="${BATCH_SIZE:-64}"
-EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-64}"
+BATCH_SIZE="${BATCH_SIZE:-16}"
+EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-16}"
 MAX_STEPS="${MAX_STEPS:-10000}"
 EVAL_EVERY="${EVAL_EVERY:-500}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
@@ -32,17 +30,15 @@ CUDA_VISIBLE_DEVICES="$GPU_SET" uv run torchrun \
   --nproc_per_node="$NPROC_PER_NODE" \
   --master_port="$MASTER_PORT" \
   -m nanomoe.experiments.lra \
-  --task=listops \
+  --task=pathx \
   --distributed=true \
   --data_root="$DATA_ROOT" \
-  --attention_backend=hullattn \
+  --attention_backend=sdpa \
   --seed="$SEED" \
   --d_model="$D_MODEL" \
   --num_heads="$NUM_HEADS" \
   --num_layers="$NUM_LAYERS" \
   --ffn_hidden_size="$FFN_HIDDEN_SIZE" \
-  --hull_temperature_start="$HULL_TEMPERATURE_START" \
-  --hull_temperature_end="$HULL_TEMPERATURE_END" \
   --batch_size="$BATCH_SIZE" \
   --eval_batch_size="$EVAL_BATCH_SIZE" \
   --max_steps="$MAX_STEPS" \

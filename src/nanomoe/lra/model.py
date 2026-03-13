@@ -26,7 +26,7 @@ class TransformerClassifierConfig:
     ffn_hidden_size: int = 512
     dropout: float = 0.1
     attention_backend: AttentionBackend = "sdpa"
-    hull_top_k: int = 8
+    hull_temperature: float = 1.0
     pooling: PoolingMode = "last"
     use_cls_token: bool = False
 
@@ -40,13 +40,8 @@ class TransformerClassifierConfig:
         return self.d_model // self.num_heads
 
 
-def _hull_attention_reference(q: Tensor, k: Tensor, v: Tensor, attention_mask: Tensor, top_k: int) -> Tensor:
-    """Brute-force 2D top-k sparse attention used as the first hull-attention reference path.
-
-    This matches the candidate-selection semantics we want from `hullattn`, but computes the
-    top-k keys by exhaustive search instead of a convex-hull data structure. The current path is
-    intentionally correctness-first and only supports 2D keys/queries.
-    """
+def _hull_attention_reference(q: Tensor, k: Tensor, v: Tensor, attention_mask: Tensor, temperature: float) -> Tensor:
+    """Dense 2D attention reference with temperature scaling for hull-attention training."""
 
     if q.shape != k.shape or k.shape != v.shape:
         raise ValueError("q, k, and v must have matching shapes")
@@ -56,22 +51,56 @@ def _hull_attention_reference(q: Tensor, k: Tensor, v: Tensor, attention_mask: T
         raise ValueError(f"hullattn reference path requires head_dim=2, got {q.shape[-1]}")
     if attention_mask.ndim != 2:
         raise ValueError(f"Expected attention_mask to have shape [batch, seq_len], got {tuple(attention_mask.shape)}")
-    if top_k < 1:
-        raise ValueError(f"hull_top_k must be >= 1, got {top_k}")
-
-    _, _, seq_len, _ = q.shape
-    top_k = min(top_k, seq_len)
+    if temperature <= 0.0:
+        raise ValueError(f"hull_temperature must be > 0, got {temperature}")
 
     scores = torch.einsum("bhqd,bhkd->bhqk", q, k)
     key_mask = attention_mask[:, None, None, :]
     scores = scores.masked_fill(~key_mask, torch.finfo(scores.dtype).min)
+    weights = torch.softmax(scores.float() / temperature, dim=-1).to(dtype=v.dtype)
+    attended = torch.einsum("bhqk,bhkd->bhqd", weights, v)
 
-    topk_scores, topk_indices = scores.topk(k=top_k, dim=-1)
+    query_mask = attention_mask[:, None, :, None]
+    return attended * query_mask.to(dtype=attended.dtype)
+
+
+def _hull_sparse_attention_reference(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    attention_mask: Tensor,
+    *,
+    temperature: float,
+    top_k: int,
+) -> Tensor:
+    """Eval-only sparse hull reference using per-query top-k selection."""
+
+    if q.shape != k.shape or k.shape != v.shape:
+        raise ValueError("q, k, and v must have matching shapes")
+    if q.ndim != 4:
+        raise ValueError(f"Expected q, k, v to have shape [batch, heads, seq_len, head_dim], got {tuple(q.shape)}")
+    if q.shape[-1] != 2:
+        raise ValueError(f"hullattn sparse reference requires head_dim=2, got {q.shape[-1]}")
+    if attention_mask.ndim != 2:
+        raise ValueError(f"Expected attention_mask to have shape [batch, seq_len], got {tuple(attention_mask.shape)}")
+    if temperature <= 0.0:
+        raise ValueError(f"hull_temperature must be > 0, got {temperature}")
+    if top_k < 1:
+        raise ValueError(f"hull_eval_top_k must be >= 1, got {top_k}")
+
+    _, _, seq_len, _ = q.shape
+    top_k = min(top_k, seq_len)
+    scores = torch.einsum("bhqd,bhkd->bhqk", q, k)
+    key_mask = attention_mask[:, None, None, :]
+    scores = scores.masked_fill(~key_mask, torch.finfo(scores.dtype).min)
+    scaled_scores = scores.float() / temperature
+
+    topk_scores, topk_indices = scaled_scores.topk(k=top_k, dim=-1)
     gather_index = topk_indices.unsqueeze(-1).expand(-1, -1, -1, -1, v.shape[-1])
     value_bank = v.unsqueeze(2).expand(-1, -1, seq_len, -1, -1)
     topk_values = torch.take_along_dim(value_bank, gather_index, dim=3)
 
-    weights = torch.softmax(topk_scores.float(), dim=-1).to(dtype=v.dtype)
+    weights = torch.softmax(topk_scores, dim=-1).to(dtype=v.dtype)
     attended = (weights.unsqueeze(-1) * topk_values).sum(dim=-2)
 
     query_mask = attention_mask[:, None, :, None]
@@ -84,9 +113,21 @@ class MultiheadSelfAttention(nn.Module):
         self.config = config
         self.num_heads = config.num_heads
         self.head_dim = config.head_dim
+        self.hull_temperature = float(config.hull_temperature)
+        self.hull_eval_top_k: int | None = None
         self.qkv_proj = nn.Linear(config.d_model, 3 * config.d_model)
         self.out_proj = nn.Linear(config.d_model, config.d_model)
         self.dropout = nn.Dropout(config.dropout)
+
+    def set_hull_temperature(self, temperature: float) -> None:
+        if temperature <= 0.0:
+            raise ValueError(f"hull_temperature must be > 0, got {temperature}")
+        self.hull_temperature = float(temperature)
+
+    def set_hull_eval_top_k(self, top_k: int | None) -> None:
+        if top_k is not None and top_k < 1:
+            raise ValueError(f"hull_eval_top_k must be >= 1, got {top_k}")
+        self.hull_eval_top_k = top_k
 
     def forward(self, hidden_states: Tensor, attention_mask: Tensor) -> Tensor:
         if self.config.attention_backend == "hullattn":
@@ -104,7 +145,25 @@ class MultiheadSelfAttention(nn.Module):
         v = v.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
         if self.config.attention_backend == "hullattn":
-            attended = _hull_attention_reference(q, k, v, attention_mask, self.config.hull_top_k)
+            if not self.training and self.hull_eval_top_k is not None:
+                attended = _hull_sparse_attention_reference(
+                    q,
+                    k,
+                    v,
+                    attention_mask,
+                    temperature=self.hull_temperature,
+                    top_k=self.hull_eval_top_k,
+                )
+            else:
+                key_mask = attention_mask[:, None, None, :]
+                attended = F.scaled_dot_product_attention(
+                    q / self.hull_temperature,
+                    k,
+                    v,
+                    attn_mask=key_mask,
+                    dropout_p=self.config.dropout if self.training else 0.0,
+                    is_causal=False,
+                )
         else:
             key_mask = attention_mask[:, None, None, :]
             attended = F.scaled_dot_product_attention(
@@ -223,6 +282,14 @@ class TransformerClassifier(nn.Module):
         last_index = lengths - 1
         batch_indices = torch.arange(hidden_states.shape[0], device=hidden_states.device)
         return hidden_states[batch_indices, last_index, :]
+
+    def set_hull_temperature(self, temperature: float) -> None:
+        for layer in self.layers:
+            layer.attn.set_hull_temperature(temperature)
+
+    def set_hull_eval_top_k(self, top_k: int | None) -> None:
+        for layer in self.layers:
+            layer.attn.set_hull_eval_top_k(top_k)
 
     def forward(self, inputs: Tensor, attention_mask: Tensor) -> Tensor:
         hidden_states = self._embed_inputs(inputs)

@@ -52,7 +52,8 @@ class TrainConfig:
     dropout: float = 0.1
     pooling: str = "last"
     attention_backend: str = "sdpa"
-    hull_top_k: int = 8
+    hull_temperature_start: float = 1.0
+    hull_temperature_end: float = 0.3
 
     lr: float = 1e-3
     min_lr: float = 1e-5
@@ -105,6 +106,34 @@ def _build_optimizer(model: torch.nn.Module, lr: float, weight_decay: float) -> 
         lr=lr,
         betas=(0.9, 0.95),
     )
+
+
+def _hull_temperature_for_step(
+    *,
+    step: int,
+    total_steps: int,
+    start_temperature: float,
+    end_temperature: float,
+) -> float:
+    if start_temperature <= 0.0:
+        raise ValueError(f"hull_temperature_start must be > 0, got {start_temperature}")
+    if end_temperature <= 0.0:
+        raise ValueError(f"hull_temperature_end must be > 0, got {end_temperature}")
+    if total_steps <= 1:
+        return end_temperature
+
+    anneal_start = total_steps // 2
+    if step < anneal_start:
+        return start_temperature
+    if anneal_start >= total_steps - 1:
+        return end_temperature
+
+    progress = (step - anneal_start) / (total_steps - 1 - anneal_start)
+    return start_temperature + progress * (end_temperature - start_temperature)
+
+
+def _hull_eval_variants(max_seq_len: int) -> list[tuple[str, int]]:
+    return [("top1", 1), ("top4", 4), ("all", max_seq_len)]
 
 
 @torch.no_grad()
@@ -195,7 +224,7 @@ def main(cfg: TrainConfig) -> None:
         ffn_hidden_size=cfg.ffn_hidden_size,
         dropout=cfg.dropout,
         attention_backend=cfg.attention_backend,
-        hull_top_k=cfg.hull_top_k,
+        hull_temperature=cfg.hull_temperature_start,
         pooling=cfg.pooling,
         use_cls_token=cfg.pooling == "cls",
     )
@@ -292,6 +321,15 @@ def main(cfg: TrainConfig) -> None:
                 batch = next(train_iter)
 
             batch = batch.to(device, non_blocking=True)
+            hull_temperature = None
+            if cfg.attention_backend == "hullattn":
+                hull_temperature = _hull_temperature_for_step(
+                    step=step,
+                    total_steps=cfg.max_steps,
+                    start_temperature=cfg.hull_temperature_start,
+                    end_temperature=cfg.hull_temperature_end,
+                )
+                model_for_checkpoint.set_hull_temperature(hull_temperature)
             optimizer.zero_grad(set_to_none=True)
             with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
                 logits = model(batch.inputs, batch.attention_mask)
@@ -330,16 +368,16 @@ def main(cfg: TrainConfig) -> None:
                 accuracy_value = accuracy
 
             tokens_seen += int(batch_tokens)
-            logger.log_metrics(
-                {
-                    "train/loss": loss_value,
-                    "train/accuracy": accuracy_value,
-                    "train/lr": float(lr),
-                    "train/grad_norm": grad_norm_value,
-                    "train/num_tokens": int(batch_tokens),
-                },
-                step=step + 1,
-            )
+            metrics = {
+                "train/loss": loss_value,
+                "train/accuracy": accuracy_value,
+                "train/lr": float(lr),
+                "train/grad_norm": grad_norm_value,
+                "train/num_tokens": int(batch_tokens),
+            }
+            if hull_temperature is not None:
+                metrics["train/hull_temperature"] = hull_temperature
+            logger.log_metrics(metrics, step=step + 1)
 
             if (step + 1) % cfg.eval_every == 0 or step == cfg.max_steps - 1:
                 val_metrics = evaluate(model, eval_loader, device=device, amp_dtype=amp_dtype)
@@ -353,6 +391,24 @@ def main(cfg: TrainConfig) -> None:
                     },
                     step=step + 1,
                 )
+
+                if cfg.attention_backend == "hullattn":
+                    try:
+                        for variant_name, top_k in _hull_eval_variants(model_config.max_seq_len):
+                            model_for_checkpoint.set_hull_eval_top_k(top_k)
+                            sparse_val_metrics = evaluate(model, eval_loader, device=device, amp_dtype=amp_dtype)
+                            sparse_test_metrics = evaluate(model, test_loader, device=device, amp_dtype=amp_dtype)
+                            logger.log_metrics(
+                                {
+                                    f"val_sparse_{variant_name}/loss": sparse_val_metrics.loss,
+                                    f"val_sparse_{variant_name}/accuracy": sparse_val_metrics.accuracy,
+                                    f"test_sparse_{variant_name}/loss": sparse_test_metrics.loss,
+                                    f"test_sparse_{variant_name}/accuracy": sparse_test_metrics.accuracy,
+                                },
+                                step=step + 1,
+                            )
+                    finally:
+                        model_for_checkpoint.set_hull_eval_top_k(None)
 
                 if val_metrics.accuracy >= best_val_accuracy:
                     best_val_accuracy = val_metrics.accuracy
