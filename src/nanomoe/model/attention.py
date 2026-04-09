@@ -15,10 +15,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 if TYPE_CHECKING:
     from nanomoe.model.config import MoEConfig
+
+create_block_mask = None
+flex_attention = None
 
 # Adopted from https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/masks/document_mask.py
 
@@ -184,8 +186,9 @@ def _flex_attention(
     if packing_doc_ids is None or packing_seq_lens is None:
         raise ValueError("flex_attention requires packing_doc_ids and packing_seq_lens")
 
+    block_mask_fn, flex_attention_fn = _get_flex_attention_ops()
     mask_mod = get_causal_doc_mask(packing_doc_ids, packing_seq_lens)
-    block_mask = create_block_mask(
+    block_mask = block_mask_fn(
         mask_mod,
         B=int(q.shape[0]),
         H=None,
@@ -195,13 +198,24 @@ def _flex_attention(
     )
     return cast(
         Tensor,
-        flex_attention(
+        flex_attention_fn(
             q,
             k,
             v,
             block_mask=block_mask,
         ),
     )
+
+
+def _get_flex_attention_ops():
+    global create_block_mask, flex_attention
+    if create_block_mask is None or flex_attention is None:
+        from torch.nn.attention.flex_attention import create_block_mask as create_block_mask_fn
+        from torch.nn.attention.flex_attention import flex_attention as flex_attention_fn
+
+        create_block_mask = create_block_mask_fn
+        flex_attention = flex_attention_fn
+    return create_block_mask, flex_attention
 
 
 class Attention(nn.Module):
