@@ -115,6 +115,13 @@ def test_moe_transformer_validates_past_key_value_length() -> None:
         _ = model(torch.randint(0, config.vocab_size, (1, 1)), past_key_values=[None], use_cache=True)
 
 
+def test_transformer_block_honors_explicit_residual_scale() -> None:
+    config = _model_config(residual_scale=0.25)
+    block = TransformerBlock(config, layer_idx=0)
+
+    assert block.residual_scale == 0.25
+
+
 def test_create_model_uses_default_router_type() -> None:
     config = _model_config()
     model = create_model(config)
@@ -144,11 +151,12 @@ def test_create_model_honors_attention_type_and_moe_kernel_overrides() -> None:
     assert model.layers[0].mlp.experts.kernel_fn is MOE_KERNEL_REGISTRY["eager_mm"]
 
 
-def test_config_round_trip_includes_attention_type_moe_kernel_and_shared_expert_scale() -> None:
+def test_config_round_trip_includes_attention_type_moe_kernel_shared_expert_scale_and_residual_scale() -> None:
     config = _model_config(
         attention_type="flex_attention",
         moe_kernel="grouped_mm_fast",
         shared_expert_scale=1.7,
+        residual_scale=0.8,
     )
 
     loaded = MoEConfig.from_dict(config.to_dict())
@@ -156,6 +164,12 @@ def test_config_round_trip_includes_attention_type_moe_kernel_and_shared_expert_
     assert loaded.attention_type == "flex_attention"
     assert loaded.moe_kernel == "grouped_mm_fast"
     assert loaded.shared_expert_scale == 1.7
+    assert loaded.residual_scale == 0.8
+
+
+def test_config_rejects_both_depth_alpha_and_residual_scale() -> None:
+    with pytest.raises(ValueError, match="Only one of depth_alpha or residual_scale"):
+        _model_config(depth_alpha=0.5, residual_scale=0.8)
 
 
 def test_config_rejects_unknown_attention_type() -> None:

@@ -66,7 +66,8 @@ class MoEConfig:
 
     # Initialization
     initializer_range: float = 0.02
-    depth_alpha: float = 0.0
+    depth_alpha: float | None = None
+    residual_scale: float | None = None  # Explicit residual scale; defaults to 1.0 when depth_alpha is unset
 
     # Tie embeddings
     tie_word_embeddings: bool = False
@@ -82,11 +83,24 @@ class MoEConfig:
         if self.moe_kernel not in valid_moe_kernels:
             raise ValueError(f"Unsupported moe_kernel: {self.moe_kernel}. Available: {sorted(valid_moe_kernels)}")
 
+        if self.depth_alpha is not None and self.residual_scale is not None:
+            raise ValueError("Only one of depth_alpha or residual_scale may be set.")
+
         if self.head_dim is None:
             object.__setattr__(self, "head_dim", self.hidden_size // self.num_attention_heads)
 
         if self.shared_expert and self.shared_expert_intermediate_size is None:
             object.__setattr__(self, "shared_expert_intermediate_size", self.intermediate_size)
+
+        if self.depth_alpha is None and self.residual_scale is None:
+            object.__setattr__(self, "residual_scale", 1.0)
+
+    @property
+    def effective_residual_scale(self) -> float:
+        """Resolve the residual scale from either depth-based or explicit scaling."""
+        if self.depth_alpha is not None:
+            return self.num_layers ** (-self.depth_alpha)
+        return 1.0 if self.residual_scale is None else self.residual_scale
 
     @property
     def num_active_params(self) -> int:
@@ -252,6 +266,7 @@ class MoEConfig:
             "hidden_dropout": self.hidden_dropout,
             "initializer_range": self.initializer_range,
             "depth_alpha": self.depth_alpha,
+            "residual_scale": self.residual_scale,
             "tie_word_embeddings": self.tie_word_embeddings,
         }
 

@@ -71,6 +71,7 @@ def main(cfg: CoordCheckConfig) -> None:
         base_config.moe_kernel = cfg.moe_kernel
     if cfg.depth_alpha is not None:
         base_config.depth_alpha = cfg.depth_alpha
+        base_config.residual_scale = None
 
     dtype_map = {
         "float32": torch.float32,

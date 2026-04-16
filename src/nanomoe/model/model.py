@@ -46,7 +46,7 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
-        self.residual_scale = config.num_layers ** (-config.depth_alpha)
+        self.residual_scale = config.effective_residual_scale
 
         # Attention
         self.self_attn = Attention(config, layer_idx)
