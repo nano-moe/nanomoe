@@ -52,6 +52,8 @@ def test_moe_transformer_forward_backward_end_to_end() -> None:
     assert isinstance(outputs.aux_loss, torch.Tensor)
     assert outputs.aux_loss.shape == torch.Size([])
     assert outputs.past_key_values is None
+    assert outputs.router_logits is None
+    assert outputs.router_expert_indices is None
 
     token_loss = F.cross_entropy(
         outputs.logits[:, :-1, :].reshape(-1, config.vocab_size),
@@ -89,6 +91,54 @@ def test_moe_transformer_kv_cache_matches_full_forward_last_token() -> None:
     assert step_outputs.past_key_values is not None
     assert step_outputs.past_key_values[0] is not None
     assert step_outputs.past_key_values[0][0].shape[2] == input_ids.shape[1]
+
+
+@torch.no_grad()
+def test_moe_transformer_can_return_router_logits() -> None:
+    torch.manual_seed(2)
+    config = _model_config()
+    model = create_model(config)
+    _unwrap_compiled_attention(model)
+    model.eval()
+
+    input_ids = torch.randint(0, config.vocab_size, (2, 5))
+    outputs = model(input_ids, use_cache=True, return_router_logits=True)
+
+    assert outputs.router_logits is not None
+    assert outputs.router_expert_indices is not None
+    assert len(outputs.router_logits) == config.num_layers
+    assert len(outputs.router_expert_indices) == config.num_layers
+    for layer_router_logits, layer_expert_indices in zip(
+        outputs.router_logits,
+        outputs.router_expert_indices,
+        strict=True,
+    ):
+        assert layer_router_logits.shape == (2, 5, config.num_experts)
+        assert layer_router_logits.requires_grad is False
+        assert layer_expert_indices.shape == (2, 5, config.num_experts_per_tok)
+        assert layer_expert_indices.dtype == torch.long
+        assert int(layer_expert_indices.min()) >= 0
+        assert int(layer_expert_indices.max()) < config.num_experts
+    assert outputs.past_key_values is not None
+
+    step_outputs = model(
+        input_ids[:, -1:],
+        past_key_values=outputs.past_key_values,
+        use_cache=True,
+        return_router_logits=True,
+    )
+
+    assert step_outputs.router_logits is not None
+    assert step_outputs.router_expert_indices is not None
+    assert len(step_outputs.router_logits) == config.num_layers
+    assert len(step_outputs.router_expert_indices) == config.num_layers
+    for layer_router_logits, layer_expert_indices in zip(
+        step_outputs.router_logits,
+        step_outputs.router_expert_indices,
+        strict=True,
+    ):
+        assert layer_router_logits.shape == (2, 1, config.num_experts)
+        assert layer_expert_indices.shape == (2, 1, config.num_experts_per_tok)
 
 
 @torch.no_grad()
@@ -151,9 +201,12 @@ def test_create_model_honors_attention_type_and_moe_kernel_overrides() -> None:
     assert model.layers[0].mlp.experts.kernel_fn is MOE_KERNEL_REGISTRY["eager_mm"]
 
 
-def test_config_round_trip_includes_attention_type_moe_kernel_shared_expert_scale_and_residual_scale() -> None:
+def test_config_round_trip_includes_attention_type_qk_rms_norm_moe_kernel_shared_expert_scale_and_residual_scale() -> (
+    None
+):
     config = _model_config(
         attention_type="flex_attention",
+        qk_rms_norm=True,
         moe_kernel="grouped_mm_fast",
         shared_expert_scale=1.7,
         residual_scale=0.8,
@@ -162,9 +215,19 @@ def test_config_round_trip_includes_attention_type_moe_kernel_shared_expert_scal
     loaded = MoEConfig.from_dict(config.to_dict())
 
     assert loaded.attention_type == "flex_attention"
+    assert loaded.qk_rms_norm is True
     assert loaded.moe_kernel == "grouped_mm_fast"
     assert loaded.shared_expert_scale == 1.7
     assert loaded.residual_scale == 0.8
+
+
+def test_qk_rms_norm_adds_attention_norm_parameters() -> None:
+    base = _model_config(qk_rms_norm=False)
+    with_qk_norm = _model_config(qk_rms_norm=True)
+    expected_extra_params = base.num_layers * 2 * (base.head_dim or base.hidden_size // base.num_attention_heads)
+
+    assert with_qk_norm.num_active_params - base.num_active_params == expected_extra_params
+    assert with_qk_norm.num_total_params - base.num_total_params == expected_extra_params
 
 
 def test_config_rejects_both_depth_alpha_and_residual_scale() -> None:

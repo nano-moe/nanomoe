@@ -136,7 +136,16 @@ class BaseRouter(nn.Module, ABC):
         expert_importance = router_probs.mean(dim=0)
 
         aux_loss = self.num_experts * torch.sum(expert_load * expert_importance)
-        return aux_loss * self.aux_loss_coef
+        return aux_loss
+    
+    def summarize_expert_usage(self, expert_indices: Tensor) -> dict[str, Tensor]:
+        """Compute statistics for router diagnostics."""
+        # compute per-expert token counts and the entropy
+        expert_assignments = F.one_hot(expert_indices, num_classes=self.num_experts).to(torch.float)
+        expert_load = expert_assignments.sum(dim=1).mean(dim=0) / self.num_experts_per_tok
+        expert_importance = self.normalize_router_logits(expert_load.unsqueeze(0)).squeeze(0)
+        expert_entropy = -(expert_importance * torch.log2(expert_importance + 1e-12)).sum()
+        return expert_entropy
 
 
 class LinearRouter(BaseRouter):

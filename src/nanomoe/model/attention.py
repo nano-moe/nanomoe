@@ -218,6 +218,22 @@ def _get_flex_attention_ops():
     return create_block_mask, flex_attention
 
 
+class HeadRMSNorm(nn.Module):
+    """RMSNorm over each attention head dimension."""
+
+    def __init__(self, head_dim: int, eps: float):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(head_dim))
+        self.eps = eps
+
+    def forward(self, x: Tensor) -> Tensor:
+        input_dtype = x.dtype
+        x = x.float()
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.eps)
+        return (self.weight * x).to(input_dtype)
+
+
 class Attention(nn.Module):
     """Multi-head attention with GQA and RoPE support."""
 
@@ -238,6 +254,11 @@ class Attention(nn.Module):
         self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+
+        # Optional QK normalization
+        self.qk_rms_norm = getattr(config, "qk_rms_norm", False)
+        self.q_norm = HeadRMSNorm(self.head_dim, config.rms_norm_eps) if self.qk_rms_norm else nn.Identity()
+        self.k_norm = HeadRMSNorm(self.head_dim, config.rms_norm_eps) if self.qk_rms_norm else nn.Identity()
 
         # RoPE
         self.rope = RoPE(self.head_dim, config.max_position_embeddings, config.rope_theta)
@@ -289,6 +310,10 @@ class Attention(nn.Module):
         q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        # Optional QK RMSNorm before RoPE.
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
         # Apply RoPE
         cos, sin = self.rope(

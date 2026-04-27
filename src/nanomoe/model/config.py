@@ -39,6 +39,7 @@ class MoEConfig:
     num_key_value_heads: int = 4  # For GQA (set = num_attention_heads for MHA)
     head_dim: int | None = None  # If None, computed as hidden_size // num_attention_heads
     attention_type: str = "fsdp_attention"  # "fsdp_attention" or "flex_attention"
+    qk_rms_norm: bool = False  # Whether to RMS-normalize Q and K per attention head before RoPE
     max_position_embeddings: int = 8192
     rope_theta: float = 1000000.0  # RoPE base frequency
 
@@ -132,6 +133,8 @@ class MoEConfig:
 
         # Norms
         norm_params = 2 * self.hidden_size  # attention norm + ffn norm
+        if self.qk_rms_norm:
+            norm_params += 2 * head_dim  # q_norm + k_norm
 
         layer_params = attn_params + active_expert_params + shared_params + router_params + norm_params
 
@@ -159,6 +162,8 @@ class MoEConfig:
 
         router_params = self.hidden_size * self.num_experts
         norm_params = 2 * self.hidden_size
+        if self.qk_rms_norm:
+            norm_params += 2 * head_dim
 
         layer_params = attn_params + expert_params + shared_params + router_params + norm_params
 
@@ -176,6 +181,19 @@ class MoEConfig:
             num_key_value_heads=2,
             intermediate_size=512,
             num_experts=4,
+            num_experts_per_tok=2,
+        )
+
+    @classmethod
+    def nano(cls) -> "MoEConfig":
+        """~ Half the size of the small model (~125M active, ~500M total)."""
+        return cls(
+            hidden_size=768,
+            num_layers=12,
+            num_attention_heads=6,
+            num_key_value_heads=6,
+            intermediate_size=1024,
+            num_experts=16,
             num_experts_per_tok=2,
         )
 
@@ -248,6 +266,7 @@ class MoEConfig:
             "num_key_value_heads": self.num_key_value_heads,
             "head_dim": self.head_dim,
             "attention_type": self.attention_type,
+            "qk_rms_norm": self.qk_rms_norm,
             "max_position_embeddings": self.max_position_embeddings,
             "rope_theta": self.rope_theta,
             "intermediate_size": self.intermediate_size,

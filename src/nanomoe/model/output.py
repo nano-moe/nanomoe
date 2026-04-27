@@ -13,3 +13,5 @@ class ModelOutput(BaseModel):
     aux_loss: Tensor | float
     past_key_values: list[tuple[Tensor, Tensor] | None] | None = None
     hidden_states: Tensor | None = None
+    router_logits: list[Tensor] | None = None
+    router_expert_indices: list[Tensor] | None = None

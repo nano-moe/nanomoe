@@ -143,15 +143,19 @@ class MoELayer(nn.Module):
         hidden_states: Tensor,
         packing_doc_ids: Tensor | None = None,
         packing_seq_lens: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
+        return_router_logits: bool = False,
+    ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, Tensor]:
         """Forward pass through MoE layer.
 
         Args:
             hidden_states: [batch_size, seq_len, hidden_size]
+            return_router_logits: Whether to include raw per-token router logits
 
         Returns:
             output: [batch_size, seq_len, hidden_size]
             aux_loss: Scalar auxiliary loss for load balancing
+            router_logits: [batch_size, seq_len, num_experts] if requested
+            expert_indices: [batch_size, seq_len, num_experts_per_tok] if requested
         """
         batch_size, seq_len, hidden_size = hidden_states.shape
         hidden_states_flat = hidden_states.view(-1, hidden_size)
@@ -165,6 +169,7 @@ class MoELayer(nn.Module):
 
         # Compute auxiliary loss
         aux_loss = self.router.compute_aux_loss(router_logits)
+        # expert_entropy = self.router.summarize_expert_usage(expert_indices)
 
         # Compute expert outputs
         final_output = self.experts(
@@ -188,7 +193,15 @@ class MoELayer(nn.Module):
             # final_output = final_output
             #  * (self.num_experts_per_tok + 1) / self.num_experts_per_tok
 
-        return final_output.view(batch_size, seq_len, hidden_size), aux_loss
+        final_output = final_output.view(batch_size, seq_len, hidden_size)
+        if return_router_logits:
+            return (
+                final_output,
+                aux_loss,
+                router_logits.view(batch_size, seq_len, self.num_experts),
+                expert_indices.view(batch_size, seq_len, self.num_experts_per_tok),
+            )
+        return final_output, aux_loss
 
 
 class DenseFFN(nn.Module):
@@ -205,16 +218,18 @@ class DenseFFN(nn.Module):
         hidden_states: Tensor,
         packing_doc_ids: Tensor | None = None,
         packing_seq_lens: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
+        return_router_logits: bool = False,
+    ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, None, None]:
         """Forward pass.
 
         Returns output and zero aux_loss (for API compatibility with MoE).
         """
-        return (
-            self.ffn(
-                hidden_states,
-                packing_doc_ids=packing_doc_ids,
-                packing_seq_lens=packing_seq_lens,
-            ),
-            torch.tensor(0.0, device=hidden_states.device),
+        output = self.ffn(
+            hidden_states,
+            packing_doc_ids=packing_doc_ids,
+            packing_seq_lens=packing_seq_lens,
         )
+        aux_loss = torch.tensor(0.0, device=hidden_states.device)
+        if return_router_logits:
+            return output, aux_loss, None, None
+        return output, aux_loss

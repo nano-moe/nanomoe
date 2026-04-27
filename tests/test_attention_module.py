@@ -168,6 +168,8 @@ def test_attention_forward_flex_uses_packing_doc_ids_and_seq_lens(monkeypatch: p
         head_dim=4,
         max_position_embeddings=16,
         rope_theta=10000.0,
+        rms_norm_eps=1e-6,
+        qk_rms_norm=False,
         attention_dropout=0.0,
         attention_type="flex_attention",
     )
@@ -239,6 +241,8 @@ def test_attention_forward_flex_matches_fsdp_for_packed_input() -> None:
         head_dim=8,
         max_position_embeddings=64,
         rope_theta=10000.0,
+        rms_norm_eps=1e-6,
+        qk_rms_norm=False,
         attention_dropout=0.0,
     )
     fsdp_cfg = SimpleNamespace(**common_cfg, attention_type="fsdp_attention")
@@ -295,6 +299,8 @@ def test_attention_forward_flex_vs_fsdp_efficiency_cuda() -> None:
         head_dim=64,
         max_position_embeddings=2048,
         rope_theta=10000.0,
+        rms_norm_eps=1e-6,
+        qk_rms_norm=False,
         attention_dropout=0.0,
     )
     fsdp_cfg = SimpleNamespace(**common_cfg, attention_type="fsdp_attention")

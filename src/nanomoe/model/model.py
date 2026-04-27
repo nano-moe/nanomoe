@@ -68,13 +68,19 @@ class TransformerBlock(nn.Module):
         packing_seq_lens: Tensor | None = None,
         past_key_value: tuple[Tensor, Tensor] | None = None,
         use_cache: bool = False,
-    ) -> tuple[Tensor, Tensor, tuple[Tensor, Tensor] | None]:
+        return_router_logits: bool = False,
+    ) -> (
+        tuple[Tensor, Tensor, tuple[Tensor, Tensor] | None]
+        | tuple[Tensor, Tensor, tuple[Tensor, Tensor] | None, Tensor | None, Tensor | None]
+    ):
         """Forward pass.
 
         Returns:
             hidden_states: Output hidden states
             aux_loss: MoE auxiliary loss
             past_key_value: KV cache if use_cache=True
+            router_logits: Raw router logits if return_router_logits=True
+            router_expert_indices: Activated expert indices if return_router_logits=True
         """
         # Self-attention
         residual = hidden_states
@@ -93,13 +99,25 @@ class TransformerBlock(nn.Module):
         # MoE FFN
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states, aux_loss = self.mlp(
-            hidden_states,
-            packing_doc_ids=packing_doc_ids,
-            packing_seq_lens=packing_seq_lens,
-        )
+        if return_router_logits:
+            hidden_states, aux_loss, router_logits, router_expert_indices = self.mlp(
+                hidden_states,
+                packing_doc_ids=packing_doc_ids,
+                packing_seq_lens=packing_seq_lens,
+                return_router_logits=True,
+            )
+        else:
+            hidden_states, aux_loss = self.mlp(
+                hidden_states,
+                packing_doc_ids=packing_doc_ids,
+                packing_seq_lens=packing_seq_lens,
+            )
+            router_logits = None
+            router_expert_indices = None
         hidden_states = residual + self.residual_scale * hidden_states
 
+        if return_router_logits:
+            return hidden_states, aux_loss, past_key_value, router_logits, router_expert_indices
         return hidden_states, aux_loss, past_key_value
 
 
@@ -156,6 +174,7 @@ class MoETransformer(nn.Module):
         past_key_values: list[tuple[Tensor, Tensor]] | None = None,
         use_cache: bool = False,
         return_dict: bool = True,
+        return_router_logits: bool = False,
     ) -> ModelOutput:
         """Forward pass.
 
@@ -168,10 +187,12 @@ class MoETransformer(nn.Module):
             past_key_values: KV cache for incremental decoding
             use_cache: Whether to return KV cache
             return_dict: Always True (for compatibility)
+            return_router_logits: Whether to return raw MoE router logits for each layer
 
         Returns:
-            ModelOutput with logits, aux_loss, and optional KV cache.
+            ModelOutput with logits, aux_loss, optional KV cache, and optional router logits.
         """
+        del return_dict
         batch_size, seq_len = input_ids.shape
 
         # Token embeddings
@@ -206,18 +227,38 @@ class MoETransformer(nn.Module):
 
         # Transformer blocks
         total_aux_loss = 0.0
+        all_router_logits: list[Tensor] | None = [] if return_router_logits else None
+        all_router_expert_indices: list[Tensor] | None = [] if return_router_logits else None
         for i, layer in enumerate(self.layers):
-            hidden_states, aux_loss, past_kv = layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                packing_doc_ids=packing_doc_ids,
-                packing_seq_lens=packing_seq_lens,
-                past_key_value=kv_cache[i],
-                use_cache=use_cache,
-            )
+            if return_router_logits:
+                hidden_states, aux_loss, past_kv, router_logits, router_expert_indices = layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    packing_doc_ids=packing_doc_ids,
+                    packing_seq_lens=packing_seq_lens,
+                    past_key_value=kv_cache[i],
+                    use_cache=use_cache,
+                    return_router_logits=True,
+                )
+            else:
+                hidden_states, aux_loss, past_kv = layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    packing_doc_ids=packing_doc_ids,
+                    packing_seq_lens=packing_seq_lens,
+                    past_key_value=kv_cache[i],
+                    use_cache=use_cache,
+                )
+                router_logits = None
+                router_expert_indices = None
             total_aux_loss = total_aux_loss + aux_loss
             new_key_values.append(past_kv)
+            if all_router_logits is not None and router_logits is not None:
+                all_router_logits.append(router_logits)
+            if all_router_expert_indices is not None and router_expert_indices is not None:
+                all_router_expert_indices.append(router_expert_indices)
 
         # Final norm
         hidden_states = self.norm(hidden_states)
@@ -233,6 +274,8 @@ class MoETransformer(nn.Module):
             aux_loss=total_aux_loss,
             past_key_values=new_key_values if use_cache else None,
             hidden_states=hidden_states,
+            router_logits=all_router_logits,
+            router_expert_indices=all_router_expert_indices,
         )
 
     @torch.no_grad()
