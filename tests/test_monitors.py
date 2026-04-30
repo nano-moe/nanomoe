@@ -4,6 +4,7 @@ from typing import cast
 
 import torch
 
+from nanomoe.data.types import PackedBatch
 from nanomoe.model.config import MoEConfig
 from nanomoe.model.model import MoETransformer, TransformerBlock, create_model
 from nanomoe.monitors import attention_logit_norms, hidden_state_cosine_similarities
@@ -86,6 +87,9 @@ def test_hidden_state_cosine_similarities_returns_layer_and_neighbour_stats() ->
 
     assert len(result.intra_sequence) == model.config.num_layers
     assert len(result.neighbouring_layers) == model.config.num_layers - 1
+    assert len(result.first_layer_reference) == model.config.num_layers - 1
+    assert len(result.router_usage_entropy) == model.config.num_layers
+    assert len(result.router_logits) == model.config.num_layers
     for layer_idx, stats in enumerate(result.intra_sequence):
         assert stats.layer_idx == layer_idx
         assert stats.num_sequences == input_ids.shape[0]
@@ -95,6 +99,35 @@ def test_hidden_state_cosine_similarities_returns_layer_and_neighbour_stats() ->
         assert stats.next_layer_idx == layer_idx + 1
         assert stats.num_tokens == input_ids.numel()
         assert -1.0 <= stats.mean_token_cosine <= 1.0
+        assert stats.mean_rms_distance >= 0.0
+        assert torch.isfinite(torch.tensor(stats.mean_relative_rms_change))
+    assert [(stats.layer_idx, stats.next_layer_idx) for stats in result.first_layer_reference] == [(0, 1), (0, 2)]
+    for stats in result.first_layer_reference:
+        assert stats.num_tokens == input_ids.numel()
+        assert -1.0 <= stats.mean_token_cosine <= 1.0
+        assert stats.mean_rms_distance >= 0.0
+        assert torch.isfinite(torch.tensor(stats.mean_relative_rms_change))
+    for layer_idx, stats in enumerate(result.router_usage_entropy):
+        assert stats.layer_idx == layer_idx
+        assert stats.num_tokens == input_ids.numel()
+        assert stats.num_assignments == input_ids.numel() * model.config.num_experts_per_tok
+        assert 0.0 <= stats.entropy <= torch.log2(torch.tensor(float(model.config.num_experts))).item()
+        assert result.router_logits[layer_idx].shape == (input_ids.numel(), model.config.num_experts)
+
+
+def test_hidden_state_cosine_similarities_flag_keeps_both_layer_comparison_groups() -> None:
+    torch.manual_seed(22)
+    model = create_model(_model_config())
+    _unwrap_compiled_attention(model)
+    input_ids = torch.randint(0, model.config.vocab_size, (2, 5))
+
+    result = hidden_state_cosine_similarities(model, input_ids, first_layer_as_reference=True)
+
+    assert len(result.neighbouring_layers) == model.config.num_layers - 1
+    assert [(stats.layer_idx, stats.next_layer_idx) for stats in result.neighbouring_layers] == [(0, 1), (1, 2)]
+    assert [(stats.layer_idx, stats.next_layer_idx) for stats in result.first_layer_reference] == [(0, 1), (0, 2)]
+    assert all(stats.num_tokens == input_ids.numel() for stats in result.neighbouring_layers)
+    assert all(stats.num_tokens == input_ids.numel() for stats in result.first_layer_reference)
 
 
 def test_hidden_state_cosine_similarities_uses_2d_attention_mask_for_valid_tokens() -> None:
@@ -110,3 +143,30 @@ def test_hidden_state_cosine_similarities_uses_2d_attention_mask_for_valid_token
 
     assert all(stats.num_sequences == 1 for stats in result.intra_sequence)
     assert all(stats.num_tokens == 2 for stats in result.neighbouring_layers)
+    assert all(stats.num_tokens == 2 for stats in result.first_layer_reference)
+    assert all(stats.mean_rms_distance >= 0.0 for stats in result.neighbouring_layers)
+    assert all(stats.mean_rms_distance >= 0.0 for stats in result.first_layer_reference)
+
+
+def test_hidden_state_cosine_similarities_accepts_packed_batches() -> None:
+    torch.manual_seed(4)
+    model = create_model(_model_config())
+    _unwrap_compiled_attention(model)
+    batch = PackedBatch(
+        tokens=torch.randint(0, model.config.vocab_size, (5,)),
+        position_ids=torch.tensor([0, 1, 2, 0, 1]),
+        cu_seqlens=torch.tensor([0, 3, 5], dtype=torch.int32),
+        token_weights=torch.ones(5),
+        labels=torch.randint(0, model.config.vocab_size, (5,)),
+    )
+
+    result = hidden_state_cosine_similarities(model, [batch])
+
+    assert all(stats.num_sequences == 2 for stats in result.intra_sequence)
+    assert all(stats.num_tokens == 5 for stats in result.neighbouring_layers)
+    assert all(stats.num_tokens == 5 for stats in result.first_layer_reference)
+    assert all(stats.mean_rms_distance >= 0.0 for stats in result.neighbouring_layers)
+    assert all(stats.mean_rms_distance >= 0.0 for stats in result.first_layer_reference)
+    assert all(stats.num_tokens == 5 for stats in result.router_usage_entropy)
+    assert all(stats.num_assignments == 5 for stats in result.router_usage_entropy)
+    assert all(layer_logits.shape == (5, model.config.num_experts) for layer_logits in result.router_logits)

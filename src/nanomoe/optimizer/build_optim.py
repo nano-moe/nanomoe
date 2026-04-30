@@ -9,7 +9,6 @@ def expert_weights_split_fn(param: torch.Tensor):
     return list(param.unbind(dim=0))
 
 def expert_weights_recombine_fn(splits):
-    """Recombine [Wq, Wk, Wv] back into Wqkv."""
     return torch.cat(splits, dim=0)
 
 def build_adjust_lr_rms_norm_func(adam_beta1, adam_beta2):
@@ -100,7 +99,11 @@ def build_optimizer_muon(
             )
         if muon_params_3d:
             muon_params_groups.append(
-                {"params": muon_params_3d, "split_fn": expert_weights_split_fn, "recombine_fn": expert_weights_recombine_fn}
+                {"params": muon_params_3d,
+                # Use default 3d spliting 
+                # "param_split_fn": expert_weights_split_fn,
+                # "param_recombine_fn": expert_weights_recombine_fn
+                }
             )
         optimizers.append(
             Muon(muon_params_groups,
@@ -126,58 +129,6 @@ def build_optimizer_muon(
 
     return optimizers
 
-
-def build_optimizer_muon(
-    model,
-    lr_adamw: float = 3e-4,
-    lr_layernorm: float = 3e-4, 
-    lr_muon: float = 2e-2,
-    wd: float = 0.1,
-    betas_adamw: tuple = (0.9, 0.9),
-    momentum_muon: float = 0.95,
-):
-    """
-    Optimizer groups for MoE models:
-      - Muon   : all 2-D+ non-embedding, non-output weight matrices
-      - AdamW  : scalars, output projection (with weight decay)
-      - AdamW  : layernorm/bias/embedding params that must have WD = 0
-    """
-    muon_params_2d, muon_params_3d, adamw_params, no_wd_params = extract_split_weights(model)
-    optimizers = []
-
-    if muon_params_2d or muon_params_3d:
-        muon_params_groups = []
-        if muon_params_2d:
-            muon_params_groups.append(
-                {"params": muon_params_2d, "split_fn": None, "recombine_fn": None}
-            )
-        if muon_params_3d:
-            muon_params_groups.append(
-                {"params": muon_params_3d, "split_fn": expert_weights_split_fn, "recombine_fn": expert_weights_recombine_fn}
-            )
-        optimizers.append(
-            Muon(muon_params_groups,
-            lr=lr_muon,
-            momentum=momentum_muon,
-            weight_decay=wd,
-            adjust_lr=build_adjust_lr_rms_norm_func(*betas_adamw),
-            ns_coefficients=POLAR_EXPRESS_COEFFICIENTS,
-            ns_algorithm='standard_newton_schulz',
-            ns_use_kernels=False
-        )
-        )
-
-    if adamw_params:
-        optimizers.append(
-            AdamW(adamw_params, lr=lr_adamw, betas=betas_adamw, weight_decay=wd)
-        )
-
-    if no_wd_params:
-        optimizers.append(
-            AdamW(no_wd_params, lr=lr_layernorm, betas=betas_adamw, weight_decay=0.0)
-        )
-
-    return optimizers
 
 def build_optimizer_adamw(
     model,
