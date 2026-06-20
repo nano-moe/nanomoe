@@ -18,8 +18,10 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from torch.optim import Optimizer
 
 TRACKER = "latest_checkpoint.txt"
+LATEST_DIR = "latest"
 
 
 def _is_dist() -> bool:
@@ -36,6 +38,10 @@ def _world_size() -> int:
 
 def _iteration_dir(base: str | Path, step: int) -> Path:
     return Path(base) / f"step_{step:07d}"
+
+
+def _latest_dir(base: str | Path) -> Path:
+    return Path(base) / LATEST_DIR
 
 
 def _tracker_path(base: str | Path) -> Path:
@@ -58,6 +64,24 @@ def _fsync_dir(path: str | Path) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _atomic_torch_save(path: str | Path, state: dict[str, Any]) -> None:
+    path = Path(path)
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    os.makedirs(path.parent, exist_ok=True)
+
+    try:
+        torch.save(state, tmp)
+        os.replace(tmp, path)
+        _fsync_file(path)
+        _fsync_dir(path.parent)
+    except Exception:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def write_tracker(base: str | Path, step: int) -> None:
@@ -152,6 +176,24 @@ def _coerce_cuda_rng_state(state: Any) -> list[torch.Tensor] | None:
     return None
 
 
+def _optimizer_state_dict(optimizer: Optimizer | list[Optimizer]) -> dict[str, Any] | list[dict[str, Any]]:
+    if isinstance(optimizer, list):
+        return [item.state_dict() for item in optimizer]
+    return optimizer.state_dict()
+
+
+def _load_optimizer_state_dict(optimizer: Optimizer | list[Optimizer], state: Any) -> None:
+    if isinstance(optimizer, list):
+        if not isinstance(state, list):
+            raise TypeError("Expected a list of optimizer states for optimizer list checkpoint.")
+        if len(optimizer) != len(state):
+            raise ValueError(f"Optimizer state count mismatch: expected {len(optimizer)}, got {len(state)}.")
+        for item, item_state in zip(optimizer, state, strict=True):
+            item.load_state_dict(item_state)
+        return
+    optimizer.load_state_dict(state)
+
+
 class _AsyncSaver(threading.Thread):
     """Background thread for async checkpoint saving."""
 
@@ -186,14 +228,7 @@ class _AsyncSaver(threading.Thread):
         self.queue.put((path, cpu_state), block=True, timeout=120.0)
 
     def _atomic_save(self, path: str, state: dict[str, Any]) -> None:
-        tmp = path + ".tmp"
-        base = os.path.dirname(path)
-        os.makedirs(base, exist_ok=True)
-
-        torch.save(state, tmp)
-        os.replace(tmp, path)
-        _fsync_file(path)
-        _fsync_dir(base)
+        _atomic_torch_save(path, state)
 
     def wait(self) -> None:
         self.queue.join()
@@ -251,6 +286,9 @@ class _Purger(threading.Thread):
 class Checkpointer:
     """Checkpoint manager with async IO and keep-last rotation.
 
+    Set overwrite_latest=True to keep writing the newest checkpoint into
+    <base>/latest while preserving the true step in the tracker and state.
+
     Usage:
         ckpt = Checkpointer("checkpoints/", keep_last=3, async_io=True)
 
@@ -268,14 +306,21 @@ class Checkpointer:
         base: str,
         keep_last: int = 3,
         async_io: bool = True,
+        overwrite_latest: bool = False,
     ) -> None:
         self.base = Path(base).absolute()
         self.keep_last = keep_last
         self.async_io = async_io
+        self.overwrite_latest = overwrite_latest
 
         self._purger = _Purger(str(self.base), keep_last) if keep_last > 0 else None
         self._saver = _AsyncSaver(on_saved=self._on_saved) if async_io else None
         self._last_step = -1
+
+    def _checkpoint_dir(self, step: int) -> Path:
+        if self.overwrite_latest:
+            return _latest_dir(self.base)
+        return _iteration_dir(self.base, step)
 
     def _on_saved(self, path: str) -> None:
         if self._purger:
@@ -285,7 +330,7 @@ class Checkpointer:
         self,
         step: int,
         model: torch.nn.Module,
-        optimizer: torch.optim.Optimizer,
+        optimizer: Optimizer | list[Optimizer],
         tokens_seen: int = 0,
         scheduler: Any = None,
         data_state: dict | None = None,
@@ -293,7 +338,7 @@ class Checkpointer:
     ) -> str:
         """Save checkpoint for this rank."""
         self._last_step = step
-        it_dir = _iteration_dir(self.base, step)
+        it_dir = self._checkpoint_dir(step)
         os.makedirs(it_dir, exist_ok=True)
 
         # Build state
@@ -301,7 +346,7 @@ class Checkpointer:
             "step": step,
             "tokens_seen": tokens_seen,
             "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
+            "optimizer": _optimizer_state_dict(optimizer),
             "rng": {
                 "torch": torch.get_rng_state(),
                 "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
@@ -325,7 +370,7 @@ class Checkpointer:
             self._saver.submit(path, state)
         else:
             cpu_state = _materialize_to_cpu(state)
-            torch.save(cpu_state, path)
+            _atomic_torch_save(path, cpu_state)
 
         # Rank 0 writes tracker and manifest
         if _rank() == 0:
@@ -352,7 +397,9 @@ class Checkpointer:
         if step < 0:
             return -1, None
 
-        it_dir = _iteration_dir(self.base, step)
+        it_dir = self._checkpoint_dir(step)
+        if self.overwrite_latest and not it_dir.exists():
+            it_dir = _iteration_dir(self.base, step)
         if not it_dir.exists():
             return -1, None
 
@@ -369,7 +416,7 @@ class Checkpointer:
     def load(
         self,
         model: torch.nn.Module,
-        optimizer: torch.optim.Optimizer,
+        optimizer: Optimizer | list[Optimizer],
         scheduler: Any = None,
     ) -> tuple[int, int]:
         """Load latest checkpoint. Returns (step, tokens_seen)."""
@@ -381,7 +428,7 @@ class Checkpointer:
         state = torch.load(path, map_location=device, weights_only=False)
 
         model.load_state_dict(state["model"])
-        optimizer.load_state_dict(state["optimizer"])
+        _load_optimizer_state_dict(optimizer, state["optimizer"])
 
         if scheduler is not None and "scheduler" in state:
             scheduler.load_state_dict(state["scheduler"])

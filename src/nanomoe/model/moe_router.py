@@ -39,6 +39,22 @@ class BaseRouter(nn.Module, ABC):
         self.aux_loss_coef = config.router_aux_loss_coef
         self.jitter_noise = config.router_jitter_noise
         self.prob_normalization = prob_normalization
+        self._aux_loss_accumulation = False
+        self.register_buffer(
+            "_aux_stats_assignments_sum",
+            torch.zeros(self.num_experts, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_aux_stats_probs_sum",
+            torch.zeros(self.num_experts, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_aux_stats_tokens",
+            torch.zeros((), dtype=torch.float32),
+            persistent=False,
+        )
 
         if self.jitter_noise < 0:
             raise ValueError(f"router_jitter_noise must be >= 0, got {self.jitter_noise}")
@@ -49,6 +65,17 @@ class BaseRouter(nn.Module, ABC):
                 f"got {self.num_experts_per_tok} with {self.num_experts} experts"
             )
             raise ValueError(msg)
+
+    def set_aux_loss_accumulation(self, enabled: bool) -> None:
+        """Enable/disable aux-loss accumulation across multiple micro-steps."""
+        self._aux_loss_accumulation = bool(enabled)
+        self.reset_aux_stats()
+
+    def reset_aux_stats(self) -> None:
+        """Reset accumulated router stats used by aux loss."""
+        self._aux_stats_assignments_sum.zero_()
+        self._aux_stats_probs_sum.zero_()
+        self._aux_stats_tokens.zero_()
 
     @abstractmethod
     def compute_router_logits(self, hidden_states: Tensor) -> Tensor:
@@ -129,6 +156,25 @@ class BaseRouter(nn.Module, ABC):
 
         router_probs = self.normalize_router_logits(router_logits)
         topk_indices = torch.topk(router_probs, self.num_experts_per_tok, dim=-1).indices
+        if self._aux_loss_accumulation and self.training:
+            router_probs_f = router_probs.float()
+            expert_assignments = F.one_hot(topk_indices, num_classes=self.num_experts).to(router_probs_f.dtype)
+            assignments_sum = expert_assignments.sum(dim=1).sum(dim=0)
+            probs_sum = router_probs_f.sum(dim=0)
+            token_count = router_probs_f.new_tensor(router_probs.shape[0])
+
+            total_assignments = self._aux_stats_assignments_sum + assignments_sum
+            total_probs = self._aux_stats_probs_sum + probs_sum
+            total_tokens = self._aux_stats_tokens + token_count
+
+            self._aux_stats_assignments_sum.copy_(total_assignments.detach())
+            self._aux_stats_probs_sum.copy_(total_probs.detach())
+            self._aux_stats_tokens.copy_(total_tokens.detach())
+
+            denom = total_tokens.clamp_min(1.0)
+            expert_load = total_assignments / (denom * self.num_experts_per_tok)
+            expert_importance = total_probs / denom
+            return self.num_experts * torch.sum(expert_load * expert_importance)
 
         # For top-k routing, normalize assignment counts by k so load sums to 1.
         expert_assignments = F.one_hot(topk_indices, num_classes=self.num_experts).to(router_probs.dtype)

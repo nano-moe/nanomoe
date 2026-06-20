@@ -164,6 +164,20 @@ class MoETransformer(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
+    def set_router_aux_loss_accumulation(self, enabled: bool) -> None:
+        """Enable/disable aux-loss accumulation for all MoE routers."""
+        for layer in self.layers:
+            router = getattr(getattr(layer, "mlp", None), "router", None)
+            if router is not None and hasattr(router, "set_aux_loss_accumulation"):
+                router.set_aux_loss_accumulation(enabled)
+
+    def reset_router_aux_stats(self) -> None:
+        """Reset accumulated router aux-loss stats for all MoE routers."""
+        for layer in self.layers:
+            router = getattr(getattr(layer, "mlp", None), "router", None)
+            if router is not None and hasattr(router, "reset_aux_stats"):
+                router.reset_aux_stats()
+
     def forward(
         self,
         input_ids: Tensor,

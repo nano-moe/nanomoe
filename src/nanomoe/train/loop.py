@@ -48,6 +48,29 @@ def _default_token_count(batch: PackedBatch) -> int:
     return int(batch.token_weights.ne(0).sum().item())
 
 
+def _unwrap_model(module: Module) -> Module:
+    target = module
+    if hasattr(target, "module"):
+        target = target.module
+    if hasattr(target, "_orig_mod"):
+        target = target._orig_mod
+    return target
+
+
+def _maybe_set_router_aux_loss_accumulation(module: Module, enabled: bool) -> None:
+    target = _unwrap_model(module)
+    setter = getattr(target, "set_router_aux_loss_accumulation", None)
+    if callable(setter):
+        setter(enabled)
+
+
+def _maybe_reset_router_aux_stats(module: Module) -> None:
+    target = _unwrap_model(module)
+    reset = getattr(target, "reset_router_aux_stats", None)
+    if callable(reset):
+        reset()
+
+
 def train_loop(
     *,
     model: Module,
@@ -85,6 +108,8 @@ def train_loop(
         else nullcontext()
     )
 
+    _maybe_set_router_aux_loss_accumulation(model, cfg.gradient_accumulation > 1)
+
     profile_enabled = (
         profile_config is not None
         and profile_config.enabled
@@ -117,6 +142,7 @@ def train_loop(
                 torch.cuda.nvtx.range_push("train_step")
             try:
                 optimizer.zero_grad()
+                _maybe_reset_router_aux_stats(model)
                 step_tokens = 0
                 step_metrics: dict[str, float] = {}
 

@@ -13,8 +13,15 @@ from transformers import AutoTokenizer
 from nanomoe.data.packed_dataset import PackedPretrainStreamGroup, cu_seqlens_to_packing_metadata
 from nanomoe.model import MoEConfig, create_model
 from nanomoe.optimizer import build_optimizer_adamw, build_optimizer_muon
-from nanomoe.train import unified_loss
+from nanomoe.train import Checkpointer, unified_loss
 from nanomoe.train.metric_helper import build_run_dir, capture_hidden_metrics, save_metrics
+
+CHECKPOINT_EVERY = 200
+DATASET_OPTIONS: dict[str, tuple[str, str]] = {
+    "math": ("nvidia/Nemotron-CC-Math-v1", "4plus"),
+    "wiki": ("Salesforce/wikitext", "wikitext-2-raw-v1"),
+    "finewebedu": ("HuggingFaceFW/fineweb-edu", "default"),
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -28,6 +35,16 @@ def parse_args() -> argparse.Namespace:
         help="Optimizer to use for the run.",
     )
     parser.add_argument(
+        "--dataset",
+        choices=tuple(DATASET_OPTIONS),
+        default="math",
+        help=(
+            "Short dataset preset to use: "
+            "math=nvidia/Nemotron-CC-Math-v1/4plus, "
+            "wiki=Salesforce/wikitext/wikitext-2-raw-v1."
+        ),
+    )
+    parser.add_argument(
         "--iterations",
         "--num-iterations",
         "--steps",
@@ -35,13 +52,18 @@ def parse_args() -> argparse.Namespace:
         default=100,
         help="Number of optimizer steps to run.",
     )
-    parser.add_argument("--grad-accum", type=int, default=1, help="Gradient accumulation micro-steps per optimizer step.")
+    parser.add_argument(
+        "--grad-accum", type=int, default=1, help="Gradient accumulation micro-steps per optimizer step."
+    )
     parser.add_argument("--warmup-steps", type=int, default=10, help="Number of LR warmup optimizer steps.")
     parser.add_argument(
         "--hidden-metrics-every",
         type=int,
         default=100,
         help="Capture hidden-state monitor metrics every N optimizer steps.",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42, help="Random seed for model initialization and dataset streams."
     )
     parser.add_argument(
         "--log-dir",
@@ -65,6 +87,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--warmup-steps must be >= 0")
     if args.hidden_metrics_every < 1:
         parser.error("--hidden-metrics-every must be >= 1")
+    if args.seed < 0:
+        parser.error("--seed must be >= 0")
     return args
 
 
@@ -196,16 +220,15 @@ def main() -> None:
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
-    seed = 42
+    seed = args.seed
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    dataset_name = "nvidia/Nemotron-CC-Math-v1"
-    dataset_config = "4plus"
+    dataset_name, dataset_config = DATASET_OPTIONS[args.dataset]
     tokenizer_name = "gpt2"
     # seq_len = 65536
-    seq_len = 49152
-    # seq_len = 32768
+    # seq_len = 49152
+    seq_len = 32768
     max_seq_len = 2048
     batch_size = 1
 
@@ -221,6 +244,8 @@ def main() -> None:
 
     model = create_model(model_config).to(device=device, dtype=dtype)
     model.train()
+    if hasattr(model, "set_router_aux_loss_accumulation"):
+        model.set_router_aux_loss_accumulation(args.grad_accum > 1)
 
     optimizers = build_optimizer(model, args)
 
@@ -261,6 +286,8 @@ def main() -> None:
 
     effective_warmup_steps = min(args.warmup_steps, max(args.iterations - 1, 0))
     run_dir = build_run_dir(args)
+    checkpoint_dir = run_dir / "checkpoints"
+    checkpointer = Checkpointer(str(checkpoint_dir), keep_last=0, async_io=False, overwrite_latest=True)
     config: dict[str, Any] = {
         "optimizer": args.optimizer,
         "learning_rate": args.learning_rate,
@@ -270,24 +297,30 @@ def main() -> None:
         "warmup_steps": args.warmup_steps,
         "effective_warmup_steps": effective_warmup_steps,
         "hidden_metrics_every": args.hidden_metrics_every,
+        "seed": args.seed,
         "use_depth_scaling": args.use_depth_scaling,
         "residual_scale": model_config.effective_residual_scale,
         "seq_len": seq_len,
         "max_seq_len": max_seq_len,
         "batch_size": batch_size,
+        "dataset": args.dataset,
         "dataset_name": dataset_name,
         "dataset_config": dataset_config,
         "tokenizer_name": tokenizer_name,
         "run_dir": str(run_dir),
+        "checkpoint_every": CHECKPOINT_EVERY,
+        "checkpoint_dir": str(checkpoint_dir),
+        "checkpoint_overwrite_latest": True,
     }
     train_records: list[dict[str, Any]] = []
     hidden_state_records: list[dict[str, Any]] = []
+    tokens_seen = 0
 
     print(
         "Starting simple pretrain: "
-        f"optimizer={args.optimizer}, lr={args.learning_rate}, weight_decay={args.weight_decay}, "
+        f"dataset={args.dataset}, optimizer={args.optimizer}, lr={args.learning_rate}, weight_decay={args.weight_decay}, "
         f"iterations={args.iterations}, grad_accum={args.grad_accum}, warmup_steps={effective_warmup_steps}, "
-        f"depth_scaling={args.use_depth_scaling}, "
+        f"seed={args.seed}, depth_scaling={args.use_depth_scaling}, "
         f"residual_scale={model_config.effective_residual_scale:.6g}, run_dir={run_dir}"
     )
 
@@ -305,6 +338,8 @@ def main() -> None:
             )
             set_learning_rate(optimizers, current_lr)
             zero_grad(optimizers)
+            if hasattr(model, "reset_router_aux_stats"):
+                model.reset_router_aux_stats()
 
             step_loss = 0.0
             step_aux_loss = 0.0
@@ -321,6 +356,7 @@ def main() -> None:
                 step_router_monitor += metrics.get("expert_entropy_by_layer", [])
 
             step_optimizers(optimizers)
+            tokens_seen += step_tokens
 
             train_record = {
                 "step": step + 1,
@@ -340,6 +376,16 @@ def main() -> None:
                     f"aux_loss={train_record['aux_loss']:.4f} "
                     f"tokens={step_tokens}"
                 )
+
+            if (step + 1) % CHECKPOINT_EVERY == 0:
+                checkpoint_path = checkpointer.save(
+                    step=step + 1,
+                    model=model,
+                    optimizer=optimizers,
+                    tokens_seen=tokens_seen,
+                    config=config,
+                )
+                print(f"Saved checkpoint to {checkpoint_path}")
 
             if (step + 1) % args.hidden_metrics_every == 0:
                 print(f"Capturing hidden-state metrics at step={step + 1}")

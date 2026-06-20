@@ -22,7 +22,14 @@ def _format_hparam_value(value: float | int | str | bool) -> str:
 
 
 def build_run_dir(args: argparse.Namespace) -> Path:
-    run_name = "_".join(
+    run_parts = []
+    dataset = getattr(args, "dataset", None)
+    if dataset is not None:
+        run_parts.append(f"data-{_format_hparam_value(dataset)}")
+    seed = getattr(args, "seed", None)
+    if seed is not None:
+        run_parts.append(f"seed-{_format_hparam_value(seed)}")
+    run_parts.extend(
         [
             f"opt-{args.optimizer}",
             f"lr-{_format_hparam_value(args.learning_rate)}",
@@ -34,6 +41,7 @@ def build_run_dir(args: argparse.Namespace) -> Path:
             f"depth-{_format_hparam_value(args.use_depth_scaling)}",
         ]
     )
+    run_name = "_".join(run_parts)
     return args.log_dir / run_name
 
 
